@@ -1,9 +1,10 @@
 import Foundation
 
 /// Sends the queue in batches of one mode and session: when 10 or more events are queued, 5 seconds
-/// after the first event queued while no flush runs, and on `flushNow()`. A flush cycle sends one
-/// batch at a time until the queue is empty or a batch fails its last retry; then its events stay
-/// queued for the next trigger. Nothing is dropped for a network error, a 429 or a 5xx.
+/// after the first event queued while no flush runs, and on `flushNow()`. A flush cycle sends one batch at a time until the queue is empty or a batch
+/// fails its last retry; then its events stay queued for the next trigger. Nothing is dropped for a
+/// network error, a 429 or a 5xx. Events the collector would refuse as clock skew are dropped
+/// before every batch.
 final class Batcher: @unchecked Sendable {
     static let flushCount = 10
     static let flushDelay: TimeInterval = 5
@@ -121,6 +122,12 @@ final class Batcher: @unchecked Sendable {
     }
 
     private func sendNext() {
+        let stale = queue.removeOutsideWindow()
+        if stale == 1 {
+            Log.warn("1 queued event was outside the collector's time window and was dropped before sending")
+        } else if stale > 1 {
+            Log.warn("\(stale) queued events were outside the collector's time window and were dropped before sending")
+        }
         let batch = queue.peekBatch(maxEvents: Self.maxEvents, maxBytes: Self.maxBytes) { mode, session in
             self.envelopeSize(mode: mode, session: session)
         }

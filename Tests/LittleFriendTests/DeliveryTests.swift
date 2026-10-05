@@ -438,6 +438,61 @@ final class DeliveryTests: XCTestCase {
         XCTAssertEqual(queue.count, 0)
     }
 
+    // MARK: The collector's time window before sending
+
+    func testAnEventOlderThan23HoursIsDroppedBeforeSending() async throws {
+        let log = LogCapture()
+        defer { log.stop() }
+        let queue = makeQueue()
+        let batcher = makeBatcher(queue)
+        batcher.enqueue(event(0))
+        clock.advance(24 * 60 * 60)
+        await flushAndWait(batcher)
+
+        XCTAssertEqual(stub.requests.count, 0, "nothing reaches the transport")
+        XCTAssertEqual(queue.count, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path), "the file is gone with its last event")
+        XCTAssertEqual(log.lines.filter { $0.contains("time window") }, ["1 queued event was outside the collector's time window and was dropped before sending"])
+    }
+
+    func testAnEventMoreThan10MinutesAheadIsDroppedBeforeSending() async throws {
+        let log = LogCapture()
+        defer { log.stop() }
+        let queue = makeQueue()
+        let batcher = makeBatcher(queue)
+        batcher.enqueue(event(0))
+        batcher.enqueue(event(1))
+        // The device clock moves back 11 minutes: the queued events now look 11 minutes ahead.
+        clock.advance(-11 * 60)
+        await flushAndWait(batcher)
+
+        XCTAssertEqual(stub.requests.count, 0, "nothing reaches the transport")
+        XCTAssertEqual(queue.count, 0)
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+        XCTAssertEqual(log.lines.filter { $0.contains("time window") }.count, 1, "one line for both")
+    }
+
+    func testTheWindowIsCheckedBeforeEveryBatchOfACycle() async throws {
+        let queue = makeQueue()
+        let fresh = (0..<50).map { event($0) }
+        // Ten seconds inside the window when the cycle starts, outside it after the retries.
+        let edge = event(50, t: clock.ms - EventQueue.maxAgeMs + 10_000)
+        (fresh + [edge]).forEach(queue.append)
+        stub.reply(.status(503), .status(503), .status(503), .status(202))
+        let batcher = makeBatcher(queue)
+        let flush = startFlush(batcher)
+        for attempt in 1...3 {
+            _ = await stub.waitForRequests(attempt)
+            let delays = await scheduler.waitForPending()
+            scheduler.advance(by: delays.first ?? 0)
+        }
+        await finished(flush)
+
+        XCTAssertEqual(stub.requests.map(\.ids), Array(repeating: ids(fresh), count: 4))
+        XCTAssertEqual(queue.count, 0, "the edge event aged out during the retries and was never sent")
+        XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
+    }
+
     func testRetryDelaysAreClampedToOneToThirtySeconds() {
         XCTAssertEqual(Batcher.retryDelay(attempt: 0, retryAfter: nil), 1)
         XCTAssertEqual(Batcher.retryDelay(attempt: 1, retryAfter: nil), 4)

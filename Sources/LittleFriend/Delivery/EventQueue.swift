@@ -87,6 +87,24 @@ final class EventQueue: @unchecked Sendable {
         }
     }
 
+    /// Removes the events the collector would refuse as clock skew by this queue's clock, with one
+    /// rewrite, and returns how many were removed.
+    func removeOutsideWindow() -> Int {
+        serial.sync {
+            let now = clock.nowMs()
+            let before = entries.count
+            entries.removeAll { !Self.inWindow($0.queued.event.t, now: now) }
+            let removed = before - entries.count
+            if removed > 0 { rewrite() }
+            return removed
+        }
+    }
+
+    /// Not older than 23 hours and not more than 10 minutes ahead of `now`.
+    static func inWindow(_ t: Int64, now: Int64) -> Bool {
+        t >= now - maxAgeMs && t <= now + maxAheadMs
+    }
+
     func remove(ids: Set<String>) {
         serial.sync {
             let before = entries.count
@@ -151,8 +169,7 @@ final class EventQueue: @unchecked Sendable {
         for line in data.split(separator: 0x0A) {
             guard let decoded = try? decoder.decode(QueuedEvent.self, from: Data(line)),
                   let entry = makeEntry(decoded),
-                  entry.queued.event.t >= now - Self.maxAgeMs,
-                  entry.queued.event.t <= now + Self.maxAheadMs
+                  Self.inWindow(entry.queued.event.t, now: now)
             else {
                 dirty = true
                 continue
