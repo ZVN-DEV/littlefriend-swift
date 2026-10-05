@@ -1256,24 +1256,32 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(events.last?.props, ["page_type": .string("product")])
     }
 
-    func testAScreenBeforeTheFirstForegroundOfABackgroundStartLandsAtTheWindowsEnd() async throws {
+    /// A scene-based app is in the background state while it launches in the foreground, so a start
+    /// in its launch is a background start too.
+    func testAScreenBeforeTheFirstForegroundLandsAtThatForeground() async throws {
         let tracker = makeTracker()
         tracker.background(at: clock.now())
         tracker.screen("/", type: nil)
         elapse(2 * minute)
         tracker.foreground(at: clock.now(), coldLaunch: true)
         let foreground = clock.ms
+        elapse(0.2)
+        tracker.track("app_open", props: [:], correlationId: nil)
         passWindow()
         elapse(2)
+        let next = clock.ms
         tracker.screen("/a", type: nil)
         let events = await sent(tracker)
 
-        XCTAssertEqual(events.map(\.name), ["$pageview", "$engage", "$pageview"])
-        guard events.count == 3 else { return }
+        XCTAssertEqual(events.map(\.name), ["$pageview", "app_open", "$engage", "$pageview"])
+        guard events.count == 4 else { return }
         XCTAssertEqual(events[0].route, "/")
         XCTAssertEqual(events[0].landing, 1)
-        XCTAssertEqual(events[0].time, foreground + Tracker.landingWindowMs, "not while the app was in the background")
-        XCTAssertEqual(events[1].props, ["ms": .number(2000), "sum": .number(2000)])
+        XCTAssertEqual(events[0].time, foreground, "not while the app was in the background")
+        XCTAssertEqual(events[1].route, "/", "after the landing it was made after")
+        XCTAssertEqual(events[1].time, foreground + 200)
+        let shown = Double(next - foreground)
+        XCTAssertEqual(events[2].props, ["ms": .number(shown), "sum": .number(shown)], "counted from the foreground")
     }
 
     func testScreenTypeIsSentOnlyWhenItIsAValidKey() async throws {

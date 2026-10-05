@@ -16,7 +16,9 @@ import Foundation
 ///
 /// A screen shown while the app is in the background becomes the screen on display and sends
 /// nothing. At the next foreground it is sent, if it differs from the screen sent last in the
-/// visit, at the foreground time, or through the window when that foreground starts a new visit.
+/// visit, at the foreground time: through the window when that foreground starts a new visit or
+/// runs the cold visit's window. A scene-based app is in the background state while it launches,
+/// so the first screen of a foreground launch lands at the launch's first activation.
 ///
 /// Storage, all in `storage` (Application Support/littlefriend, excluded from backup): the event
 /// queue, `session.json` in journey mode only, and the empty `opt-out` flag file.
@@ -444,6 +446,8 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
 
     /// Ends the window at `end`. `link` is the source of its visit. The held calls replay in
     /// order; then the screen on display, when this visit has not sent it, is the landing at `end`.
+    /// A screen shown before the foreground the window counts from was on display from that
+    /// foreground: it lands at that moment, ahead of the calls made from then on.
     private func closeWindow(at end: Int64, link: Campaign? = nil) {
         guard let closing = window else { return }
         window = nil
@@ -457,23 +461,35 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
             // A visit with a source ends the session; none of this visit's events went out yet.
             session = nil
         }
+        // Set while the screen on display is one shown before `closing.since`.
+        var shownBefore = false
         for call in closing.held {
+            if shownBefore, let since = closing.since, call.time >= since {
+                landShown(at: since)
+                shownBefore = false
+            }
             switch call {
             case let .screen(clean, type, t, background):
                 if background {
                     route = clean
                     routeType = type
+                    shownBefore = true
                 } else {
                     showScreen(clean, pageType: type, at: t)
+                    shownBefore = false
                 }
             case let .track(name, props, correlationId, t): sendTrack(name, props: props, correlationId: correlationId, at: t)
             case let .consent(consent, t): applyConsent(consent, at: t)
             }
         }
-        if active, let shown = route, shown != sentRoute {
-            closeScreen(at: end)
-            sendView(shown, pageType: routeType, at: end)
-        }
+        landShown(at: shownBefore ? closing.since ?? end : end)
+    }
+
+    /// The screen on display, when this visit has not sent it and the app is in the foreground.
+    private func landShown(at t: Int64) {
+        guard active, let shown = route, shown != sentRoute else { return }
+        closeScreen(at: t)
+        sendView(shown, pageType: routeType, at: t)
     }
 
     /// The screen open at a switch of mode is closed in the mode it was counted in, and counts on in
