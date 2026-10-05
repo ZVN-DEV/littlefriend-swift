@@ -433,8 +433,72 @@ final class DeliveryTests: XCTestCase {
         XCTAssertEqual(queue.count, 60, "nothing is dropped for a network or 5xx failure")
         XCTAssertEqual(makeQueue().count, 60, "and nothing is dropped on disk")
 
+        // Sixty waiting events are not ten enqueued since the cycle started: one more arms the timer.
+        let extra = event(60)
+        batcher.enqueue(extra)
+        XCTAssertEqual(scheduler.pendingDelays, [5], "no cycle starts on the enqueue")
+        scheduler.advance(by: 5)
+        _ = await stub.waitForRequests(6)
         await flushAndWait(batcher)
-        XCTAssertEqual(stub.requests.dropFirst(4).flatMap(\.ids), ids(events), "the next trigger sends them, same ids")
+        XCTAssertEqual(stub.requests.dropFirst(4).flatMap(\.ids), ids(events + [extra]), "the timer sends them, same ids")
+        XCTAssertEqual(queue.count, 0)
+    }
+
+    func testAfterAFailedCycleOneMoreEventWaitsForTheTimer() async {
+        let queue = makeQueue()
+        let batcher = makeBatcher(queue)
+        let events = (0..<10).map { event($0) }
+        stub.reply(.status(503), .status(503), .status(503), .status(503))
+        events.prefix(9).forEach(batcher.enqueue)
+        XCTAssertEqual(scheduler.pendingDelays, [5])
+        scheduler.advance(by: 5)
+        let flush = startFlush(batcher)
+        for attempt in 1...3 {
+            _ = await stub.waitForRequests(attempt)
+            let delays = await scheduler.waitForPending()
+            scheduler.advance(by: delays.first ?? 0)
+        }
+        await finished(flush)
+        XCTAssertEqual(stub.requests.count, 4, "the first send and three retries")
+        XCTAssertEqual(scheduler.pendingDelays, [], "a cycle that fails its retries arms nothing")
+
+        batcher.enqueue(events[9])
+        XCTAssertEqual(scheduler.pendingDelays, [5], "ten queued, one enqueued since the cycle started: the timer is armed")
+        XCTAssertEqual(stub.requests.count, 4)
+        scheduler.advance(by: 4.9)
+        XCTAssertEqual(stub.requests.count, 4)
+        scheduler.advance(by: 0.1)
+        let sent = await stub.waitForRequests(5)
+        XCTAssertEqual(sent.last?.ids, ids(events))
+        await flushAndWait(batcher)
+        XCTAssertEqual(queue.count, 0)
+    }
+
+    func testTenEnqueuedSinceAFailedCycleStartedStartTheNextAtOnce() async {
+        let queue = makeQueue()
+        let batcher = makeBatcher(queue)
+        stub.reply(.status(503), .status(503), .status(503), .status(503))
+        batcher.enqueue(event(0))
+        let flush = startFlush(batcher)
+        _ = await stub.waitForRequests(1)
+        let during = (1...9).map { event($0) }
+        during.forEach(batcher.enqueue)
+        XCTAssertEqual(scheduler.pendingDelays, [1], "only the retry waits while a cycle runs")
+        for attempt in 1...3 {
+            let delays = await scheduler.waitForPending()
+            scheduler.advance(by: delays.first ?? 0)
+            _ = await stub.waitForRequests(attempt + 1)
+        }
+        await finished(flush)
+        XCTAssertEqual(stub.requests.count, 4)
+
+        // Ten enqueued since that cycle started (one before it, nine during it): the next one sends.
+        let last = event(10)
+        batcher.enqueue(last)
+        XCTAssertEqual(scheduler.pendingDelays, [], "a cycle starts instead of the timer")
+        let sent = await stub.waitForRequests(5)
+        XCTAssertEqual(sent.last?.ids.count, 11)
+        await flushAndWait(batcher)
         XCTAssertEqual(queue.count, 0)
     }
 

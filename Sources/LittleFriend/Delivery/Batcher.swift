@@ -1,7 +1,8 @@
 import Foundation
 
-/// Sends the queue in batches of one mode and session: when 10 or more events are queued, 5 seconds
-/// after the first event queued while no flush runs, and on `flushNow()`. A flush cycle sends one batch at a time until the queue is empty or a batch
+/// Sends the queue in batches of one mode and session: once 10 events have been enqueued since the
+/// current or last cycle started, 5 seconds after an enqueue that found no timer and no cycle, and
+/// on `flushNow()`. A flush cycle sends one batch at a time until the queue is empty or a batch
 /// fails its last retry; then its events stay queued for the next trigger. Nothing is dropped for a
 /// network error, a 429 or a 5xx. Events the collector would refuse as clock skew are dropped
 /// before every batch.
@@ -35,6 +36,8 @@ final class Batcher: @unchecked Sendable {
     /// Changes when a cycle starts and when the batcher stops, so an answer to an older cycle's
     /// request never drives a newer cycle.
     private var cycle = 0
+    /// Events enqueued since the current or last cycle started.
+    private var enqueuedSinceCycle = 0
     private var waiters: [CheckedContinuation<Void, Never>] = []
 
     init(
@@ -55,8 +58,9 @@ final class Batcher: @unchecked Sendable {
         serial.sync {
             guard !stopped else { return }
             queue.append(event)
+            enqueuedSinceCycle += 1
             guard !flushing else { return }
-            if queue.count >= Self.flushCount {
+            if enqueuedSinceCycle >= Self.flushCount {
                 startCycle()
             } else if timer == nil {
                 timerID += 1
@@ -116,6 +120,7 @@ final class Batcher: @unchecked Sendable {
     private func startCycle() {
         flushing = true
         cycle += 1
+        enqueuedSinceCycle = 0
         timer?.cancel()
         timer = nil
         sendNext()
