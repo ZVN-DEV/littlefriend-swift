@@ -192,12 +192,33 @@ struct LiveHost: PlatformHost {
     }
 }
 
+/// Begins and ends the background tasks a send after the app left the foreground runs in.
+@MainActor
+protocol BackgroundTasks {
+    func begin(expiration: @escaping @MainActor @Sendable () -> Void) -> UIBackgroundTaskIdentifier
+    func end(_ id: UIBackgroundTaskIdentifier)
+}
+
+/// The application's background tasks.
+struct ApplicationBackgroundTasks: BackgroundTasks {
+    func begin(expiration: @escaping @MainActor @Sendable () -> Void) -> UIBackgroundTaskIdentifier {
+        UIApplication.shared.beginBackgroundTask(withName: "io.littlefriend.send", expirationHandler: expiration)
+    }
+
+    func end(_ id: UIBackgroundTaskIdentifier) {
+        UIApplication.shared.endBackgroundTask(id)
+    }
+}
+
 /// A send after the app entered the background, inside a background task so it can finish.
 @MainActor
 enum BackgroundSend {
+    /// Tests count the tasks through it.
+    static var tasks: BackgroundTasks = ApplicationBackgroundTasks()
+
     static func start(_ target: LifecycleTarget) {
-        let task = BackgroundTask()
-        task.id = UIApplication.shared.beginBackgroundTask(withName: "io.littlefriend.send") { task.end() }
+        let task = BackgroundTask(tasks: tasks)
+        task.id = task.tasks.begin { task.end() }
         Task { @MainActor in
             await target.flush()
             task.end()
@@ -208,11 +229,16 @@ enum BackgroundSend {
 /// Ends its background task once, from the expiration handler or after the send.
 @MainActor
 final class BackgroundTask: Sendable {
+    let tasks: BackgroundTasks
     var id: UIBackgroundTaskIdentifier = .invalid
+
+    init(tasks: BackgroundTasks) {
+        self.tasks = tasks
+    }
 
     func end() {
         guard id != .invalid else { return }
-        UIApplication.shared.endBackgroundTask(id)
+        tasks.end(id)
         id = .invalid
     }
 }

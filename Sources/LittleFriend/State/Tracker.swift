@@ -412,13 +412,16 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         guard let id = window?.id else { return }
         window?.since = t
         window?.timer = scheduler.schedule(after: TimeInterval(Self.landingWindowMs) / 1000) { [weak self] in
-            self?.serial.async { self?.windowTimerFired(id) }
+            self?.windowTimerFired(id)
         }
     }
 
+    /// Called on the scheduler's thread. The timer of a window that already ended does nothing.
     private func windowTimerFired(_ id: Int) {
-        guard let open = window, open.id == id, let end = open.end else { return }
-        closeWindow(at: end)
+        serial.async {
+            guard let open = self.window, open.id == id, let end = open.end else { return }
+            self.closeWindow(at: end)
+        }
     }
 
     /// A call made at or after the window's end finds it closed, however late its timer runs.

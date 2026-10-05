@@ -11,7 +11,7 @@ final class UIKitTests: XCTestCase {
     private static let recorder = Recorder()
     private static let storage = FileManager.default.temporaryDirectory
         .appendingPathComponent("lf-uikit-\(UUID().uuidString)").appendingPathComponent("littlefriend")
-    private static var window: UIWindow?
+    @MainActor private static var window: UIWindow?
 
     override class func setUp() {
         super.setUp()
@@ -43,26 +43,73 @@ final class UIKitTests: XCTestCase {
     private var recorder: Recorder { Self.recorder }
 
     /// Every event sent after `marker`, once everything called so far has gone out.
+    @MainActor
     private func events(after marker: Int) async -> [Recorder.Event] {
         await Facade.shared.flushed()
         return Array(recorder.events.dropFirst(marker))
     }
 
-    private func screens(after marker: Int) async -> [String] {
-        await events(after: marker).filter { $0.name == "$pageview" }.compactMap(\.route)
+    /// The events sent after `marker` once `done` holds for them, or after 5 seconds. Each try
+    /// sends what is queued first.
+    @MainActor
+    private func events(after marker: Int, until done: ([Recorder.Event]) -> Bool) async -> [Recorder.Event] {
+        let deadline = Date() + 5
+        while true {
+            let sent = await events(after: marker)
+            if done(sent) || Date() >= deadline { return sent }
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
     }
 
-    /// Shows `controller` as the window's root and lets it appear.
+    /// The `$pageview` events sent after `marker`, once their routes are `routes` or after 5 seconds.
+    @MainActor
+    private func views(_ routes: [String], after marker: Int) async -> [Recorder.Event] {
+        let pageviews = { (events: [Recorder.Event]) in events.filter { $0.name == "$pageview" } }
+        return await pageviews(events(after: marker) { pageviews($0).compactMap(\.route) == routes })
+    }
+
+    /// The screen routes sent after `marker`, once they are `routes` or after 5 seconds.
+    @MainActor
+    private func screens(_ routes: [String], after marker: Int) async -> [String] {
+        await views(routes, after: marker).compactMap(\.route)
+    }
+
+    /// Shows `controller` as the window's root and waits, up to 5 seconds, for the screen it shows
+    /// to be in the window: UIKit calls its `viewDidAppear(_:)` in that pass, inside the setter or
+    /// on the next turn of the main queue. SwiftUI's `onAppear` comes with a later render pass.
     @MainActor
     private func show(_ controller: UIViewController) async {
         Self.window?.rootViewController = controller
-        await settle()
+        let shown = Self.leaf(of: controller)
+        let deadline = Date() + 5
+        while shown.viewIfLoaded?.window == nil, Date() < deadline {
+            await mainTurn()
+        }
+        await mainTurn()
     }
 
-    /// Lets UIKit and SwiftUI run their appearance callbacks.
     @MainActor
-    private func settle() async {
-        try? await Task.sleep(nanoseconds: 300_000_000)
+    private func mainTurn() async {
+        await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
+            DispatchQueue.main.async { done.resume() }
+        }
+    }
+
+    /// The controller a container shows.
+    @MainActor
+    private static func leaf(of controller: UIViewController) -> UIViewController {
+        switch controller {
+        case let navigation as UINavigationController:
+            return navigation.topViewController.map(leaf) ?? navigation
+        case let tabs as UITabBarController:
+            return tabs.selectedViewController.map(leaf) ?? tabs
+        case let pages as UIPageViewController:
+            return pages.viewControllers?.first.map(leaf) ?? pages
+        case let split as UISplitViewController:
+            return split.viewController(for: .primary).map(leaf) ?? split
+        default:
+            return controller
+        }
     }
 
     // MARK: SwiftUI
@@ -72,13 +119,12 @@ final class UIKitTests: XCTestCase {
         let marker = recorder.events.count
         let model = PageModel()
         await show(UIHostingController(rootView: Pages(model: model)))
+        _ = await screens(["/products/:id"], after: marker)
         model.tick += 1
-        await settle()
         model.page = 1
-        await settle()
+        _ = await screens(["/products/:id", "/cart"], after: marker)
         model.page = 0
-        await settle()
-        let sent = await events(after: marker).filter { $0.name == "$pageview" }
+        let sent = await views(["/products/:id", "/cart", "/products/:id"], after: marker)
 
         XCTAssertEqual(sent.compactMap(\.route), ["/products/:id", "/cart", "/products/:id"], "a re-render is not a new appearance")
         XCTAssertEqual(sent.map { $0.props?["page_type"] as? String }, ["product", nil, "product"])
@@ -88,15 +134,15 @@ final class UIKitTests: XCTestCase {
     func testLfDeepLinksHandsLinksToTheSDK() async throws {
         let marker = recorder.events.count
         await show(UIHostingController(rootView: Text("links").lfScreen("/links").lfDeepLinks()))
+        _ = await screens(["/links"], after: marker)
         DeepLinks.open(URL(string: "lfshop://open?utm_source=Newsletter&utm_campaign=Launch")!)
-        // Each link's visit lands when its landing window ends.
-        try await Task.sleep(nanoseconds: 700_000_000)
+        // Each link's visit lands the screen on display when its landing window ends.
+        _ = await screens(["/links", "/links"], after: marker)
         let activity = NSUserActivity(activityType: NSUserActivityTypeBrowsingWeb)
         activity.webpageURL = URL(string: "https://shop.example.com/sale?utm_source=partner")!
         DeepLinks.continueActivity(activity)
         DeepLinks.continueActivity(NSUserActivity(activityType: NSUserActivityTypeBrowsingWeb))
-        try await Task.sleep(nanoseconds: 700_000_000)
-        let views = await events(after: marker).filter { $0.name == "$pageview" }
+        let views = await views(["/links", "/links", "/links"], after: marker)
 
         XCTAssertEqual(views.compactMap(\.route), ["/links", "/links", "/links"])
         XCTAssertEqual(views.map(\.landing), [nil, 1, 1], "each link lands the screen on display in a new visit")
@@ -129,11 +175,9 @@ final class UIKitTests: XCTestCase {
         await show(AppPageViewController())
         await show(AppHostingController(rootView: Text("app hosted")))
 
-        let routes = await screens(after: marker)
-        XCTAssertEqual(
-            routes, ["/Checkout", "/orders/:id", "/Settings", "/Profile", "/Cart"],
-            "containers, hosting and system controllers send nothing"
-        )
+        let expected = ["/Checkout", "/orders/:id", "/Settings", "/Profile", "/Cart"]
+        let routes = await screens(expected, after: marker)
+        XCTAssertEqual(routes, expected, "containers, hosting and system controllers send nothing")
     }
 
     func testControllerNames() {
@@ -145,12 +189,13 @@ final class UIKitTests: XCTestCase {
 
     // MARK: App block, lifecycle
 
+    @MainActor
     func testTheBatchCarriesTheBundlesAppBlockAndTestTraffic() async throws {
         let marker = recorder.events.count
         LittleFriend.track("app_block_check")
-        let after = await events(after: marker)
-        let sent = try XCTUnwrap(after.first)
-        let idiom = await MainActor.run { UIDevice.current.userInterfaceIdiom }
+        let after = await events(after: marker) { $0.contains { $0.name == "app_block_check" } }
+        let sent = try XCTUnwrap(after.first { $0.name == "app_block_check" })
+        let idiom = UIDevice.current.userInterfaceIdiom
 
         XCTAssertEqual(sent.batch["a"] as? [String: String], [
             "i": try XCTUnwrap(Bundle.main.bundleIdentifier),
@@ -166,24 +211,71 @@ final class UIKitTests: XCTestCase {
     @MainActor
     func testTheBackgroundClosesTheScreenAndSendsInsideABackgroundTask() async throws {
         XCTAssertEqual(UIApplication.shared.applicationState, .active, "start while active counted as the cold launch")
+        let tasks = CountingTasks(replacing: BackgroundSend.tasks)
+        BackgroundSend.tasks = tasks
+        defer { BackgroundSend.tasks = tasks.replaced }
         let marker = recorder.events.count
         await show(UIHostingController(rootView: Text("background").lfScreen("/background")))
+        _ = await screens(["/background"], after: marker)
+        // Time on the screen, for its $engage.
         try await Task.sleep(nanoseconds: 1_200_000_000)
         let before = recorder.requestCount
-        NotificationCenter.default.post(name: UIApplication.didEnterBackgroundNotification, object: UIApplication.shared)
-        let arrived = await recorder.waitForRequests(before + 1)
-        XCTAssertTrue(arrived, "the background sends without a flush call")
-        let engage = Array(recorder.events.dropFirst(marker)).last { $0.name == "$engage" }
+        for round in 1...2 {
+            NotificationCenter.default.post(name: UIApplication.didEnterBackgroundNotification, object: UIApplication.shared)
+            if round == 1 {
+                let arrived = await recorder.waitForRequests(before + 1)
+                XCTAssertTrue(arrived, "the background sends without a flush call")
+            }
+            let ended = await tasks.waitForEnds(round)
+            XCTAssertTrue(ended, "round \(round): the task ends after the send")
+            XCTAssertEqual(tasks.begun, round, "round \(round): one task begins per background")
+            XCTAssertEqual(tasks.ended, round, "round \(round): and ends once")
+            XCTAssertEqual(tasks.open, [], "round \(round): the task that began is the one that ended")
+            NotificationCenter.default.post(name: UIApplication.didBecomeActiveNotification, object: UIApplication.shared)
+        }
+        let engage = Array(recorder.events.dropFirst(marker)).first { $0.name == "$engage" }
         XCTAssertEqual(engage?.route, "/background")
         XCTAssertGreaterThanOrEqual((engage?.props?["ms"] as? Int) ?? 0, 1200)
-        NotificationCenter.default.post(name: UIApplication.didBecomeActiveNotification, object: UIApplication.shared)
-        await settle()
-        let routes = await screens(after: marker)
+        let routes = await screens(["/background"], after: marker)
         XCTAssertEqual(routes, ["/background"], "a short background is the same visit")
     }
 }
 
 // MARK: Fixtures
+
+/// Background tasks that are only counted: each begin hands out a new identifier.
+@MainActor
+final class CountingTasks: BackgroundTasks {
+    let replaced: BackgroundTasks
+    private(set) var begun = 0
+    private(set) var ended = 0
+    /// The identifiers handed out and not yet ended.
+    private(set) var open: Set<Int> = []
+
+    init(replacing replaced: BackgroundTasks) {
+        self.replaced = replaced
+    }
+
+    func begin(expiration: @escaping @MainActor @Sendable () -> Void) -> UIBackgroundTaskIdentifier {
+        begun += 1
+        open.insert(begun)
+        return UIBackgroundTaskIdentifier(rawValue: begun)
+    }
+
+    func end(_ id: UIBackgroundTaskIdentifier) {
+        ended += 1
+        open.remove(id.rawValue)
+    }
+
+    /// True once `count` tasks have ended, false after 5 seconds.
+    func waitForEnds(_ count: Int) async -> Bool {
+        let deadline = Date() + 5
+        while ended < count, Date() < deadline {
+            try? await Task.sleep(nanoseconds: 20_000_000)
+        }
+        return ended >= count
+    }
+}
 
 final class PageModel: ObservableObject {
     @Published var page = 0
