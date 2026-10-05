@@ -283,11 +283,11 @@ final class Tracker: @unchecked Sendable {
                 Log.warn("a correlation id was left out: it fails CORRELATION_ID_RE or looks like personal data")
             }
         }
-        // Aggregate mode: the landing's source rides on every later non-screen event of the visit.
-        let source = journey ? nil : visit?.source
+        // Aggregate mode: every track of the visit says it entered from outside (`l: 1`), with the
+        // landing's source when the visit has one. A direct visit sends `l` alone.
         emit(
-            name, route: route ?? "/", at: t, props: Props.clean(props), landing: source != nil,
-            source: source, correlationId: x
+            name, route: route ?? "/", at: t, props: Props.clean(props), landing: !journey,
+            source: journey ? nil : visit?.source, correlationId: x
         )
     }
 

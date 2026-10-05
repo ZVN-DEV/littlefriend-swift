@@ -161,8 +161,25 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(events[2].campaign?["s"], "newsletter", "and keeps its source")
         XCTAssertEqual(events[3].landing, 1, "30 minutes away: the next screen is a new landing")
         XCTAssertNil(events[3].campaign, "with no source")
-        XCTAssertNil(events[4].landing, "a track after a direct landing carries nothing extra")
-        XCTAssertNil(events[4].campaign)
+        XCTAssertEqual(events[4].landing, 1, "a track after a direct landing says it entered from outside")
+        XCTAssertNil(events[4].campaign, "with no source")
+    }
+
+    func testEveryAggregateTrackInADirectVisitCarriesTheLandingFlag() async throws {
+        let tracker = makeTracker()
+        tracker.foreground(at: clock.now(), coldLaunch: true)
+        tracker.track("early", props: [:], correlationId: nil)
+        tracker.screen("/a", type: nil)
+        elapse(2)
+        tracker.track("signup", props: [:], correlationId: nil)
+        tracker.screen("/b", type: nil)
+        tracker.track("checkout", props: [:], correlationId: nil)
+        let events = await sent(tracker)
+
+        XCTAssertEqual(events.map(\.name), ["early", "$pageview", "signup", "$engage", "$pageview", "checkout"])
+        XCTAssertEqual(events.map(\.landing), [1, 1, 1, nil, nil, 1], "tracks carry l, $engage and later screens do not")
+        XCTAssertEqual(events.compactMap(\.campaign), [], "a direct visit has no c")
+        XCTAssertNil(events[2].event["r"], "and iOS has no referrer")
     }
 
     func testADeepLinkWhileActiveStartsANewVisitAtOnce() async throws {
