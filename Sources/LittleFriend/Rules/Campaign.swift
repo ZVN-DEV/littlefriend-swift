@@ -51,8 +51,8 @@ enum CampaignRules {
     /// nil when empty or when it looks like personal data.
     static func cleanValue(_ input: String) -> String? {
         if input.isEmpty { return nil }
-        // NSString's canonical mapping matches JavaScript's toLowerCase, final sigma included.
-        let lower = (Text.trim(Text.clean(input)) as NSString).lowercased
+        // Lowercased before the cut, so the sigma rule reads characters past the 64th, as the contract does.
+        let lower = Text.lowercase(Text.trim(Text.clean(input)))
         let value = Text.prefix(lower, utf16: maxValueLength)
         if value.isEmpty || Text.looksLikePII(value) { return nil }
         return value

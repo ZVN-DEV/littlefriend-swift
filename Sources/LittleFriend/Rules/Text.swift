@@ -38,6 +38,37 @@ enum Text {
         return String(scalars)
     }
 
+    /// JavaScript's `toLowerCase()`. Every capital sigma is decided by `sigma(in:at:)` first, then
+    /// NSString lowercases the rest: NSString picks the final form from the next character alone.
+    static func lowercase(_ value: String) -> String {
+        let scalars = Array(value.unicodeScalars)
+        guard scalars.contains(capitalSigma) else { return (value as NSString).lowercased }
+        var decided = String.UnicodeScalarView()
+        for (index, scalar) in scalars.enumerated() {
+            decided.append(scalar == capitalSigma ? sigma(in: scalars, at: index) : scalar)
+        }
+        return (String(decided) as NSString).lowercased
+    }
+
+    private static let capitalSigma: Unicode.Scalar = "\u{3A3}"
+
+    /// Unicode SpecialCasing's Final_Sigma for the capital sigma at `index`: final (U+03C2) when a
+    /// cased character comes before it and none after it, skipping Case_Ignorable characters both
+    /// ways; otherwise U+03C3. A character that is both cased and Case_Ignorable is skipped, as ICU
+    /// (and so V8) does.
+    static func sigma(in scalars: [Unicode.Scalar], at index: Int) -> Unicode.Scalar {
+        func casedFirst(_ indices: some Sequence<Int>) -> Bool {
+            for j in indices {
+                let properties = scalars[j].properties
+                if properties.isCaseIgnorable { continue }
+                return properties.isCased
+            }
+            return false
+        }
+        let final = casedFirst((0..<index).reversed()) && !casedFirst((index + 1)..<scalars.count)
+        return final ? "\u{3C2}" : "\u{3C3}"
+    }
+
     /// JavaScript's `trim()`: removes `\s` from both ends.
     static func trim(_ value: String) -> String {
         let units = Array(value.utf16)

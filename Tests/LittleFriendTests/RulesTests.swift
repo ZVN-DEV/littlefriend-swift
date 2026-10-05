@@ -103,6 +103,36 @@ import Testing
         #expect(CampaignRules.cleanValue(input) == want)
     }
 
+    /// Final_Sigma as toLowerCase applies it: a cased letter before the sigma and none after it,
+    /// Case_Ignorable characters skipped on both sides. The same cases are in the shared vectors.
+    static let sigma: [(String, String)] = [
+        ("ΕΚΠΤΩΣΕΙΣ.gr", "εκπτωσεισ.gr"),
+        ("promo-ΑΘΗΝΑΣ:b", "promo-αθηνασ:b"),
+        ("ΝΕΟΣ_ΧΡΟΝΟΣ", "νεος_χρονος"),
+        ("g1234Σ", "g1234σ"),
+        ("ΟΔΥΣΣΕΥΣ", "οδυσσευς"),
+        ("Σ", "σ"),
+        ("ΑΣ.", "ας."),
+        ("ΑΣ\u{301}Β", "ασ\u{301}β"),
+        ("ΑΣ'Σ", "ασ'ς"),
+        ("1Σ2", "1σ2"),
+        ("ΑΣ-Β", "ας-β"),
+        ("ΑΣ:", "ας:"),
+        ("ΑΣ ΒΣ", "ας βς"),
+        ("Σ.Σ", "σ.ς"),
+        ("ΑΣ\u{200D}Β", "ασ\u{200D}β"),
+    ]
+
+    @Test(arguments: sigma)
+    func finalSigma(input: String, want: String) {
+        #expect(CampaignRules.cleanValue(input) == want, "cleanValue \(input.unicodeScalars.map { String($0.value, radix: 16) })")
+        let encoded = input.addingPercentEncoding(withAllowedCharacters: .alphanumerics)!
+        #expect(
+            CampaignRules.fromURL("https://acme.com/?utm_campaign=\(encoded)", extended: false) == Campaign(c: want),
+            "utm_campaign \(input.unicodeScalars.map { String($0.value, radix: 16) })"
+        )
+    }
+
     @Test func campaignValueEmptyIsNil() {
         #expect(CampaignRules.cleanValue("") == nil)
         #expect(CampaignRules.cleanValue("   ") == nil)
