@@ -73,6 +73,13 @@ final class APITests: XCTestCase {
         return transport.sent
     }
 
+    /// Lets the facade's engine finish its calls, then runs the scheduler past the landing window.
+    private func passWindow(_ facade: Facade) {
+        facade.tracker?.drain()
+        scheduler.advance(by: TimeInterval(Tracker.landingWindowMs) / 1000)
+        facade.tracker?.drain()
+    }
+
     /// Waits for a start that finishes on the main thread.
     private func engine(of facade: Facade, timeout: TimeInterval = 5) async -> Tracker? {
         let deadline = Date() + timeout
@@ -116,6 +123,7 @@ final class APITests: XCTestCase {
         let facade = makeFacade()
         for i in 0..<103 { facade.perform(.track("e\(i)", props: [:], correlationId: nil)) }
         facade.start(key: key, options: .init(), environment: makeEnvironment())
+        passWindow(facade)
         facade.perform(.track("after_start", props: [:], correlationId: nil))
         let events = await sent(facade)
 
@@ -187,6 +195,7 @@ final class APITests: XCTestCase {
         let facade = makeFacade()
         facade.start(key: key, options: options, environment: makeEnvironment(bundleVersion: "123456789"))
         facade.perform(.screen("/", type: nil))
+        passWindow(facade)
         _ = await sent(facade)
         XCTAssertEqual(transport.batches.first?["a"]?.object?["v"], .string("2026.10.5+77"))
     }
@@ -201,6 +210,7 @@ final class APITests: XCTestCase {
         journey.mode = .journey
         facade.start(key: "lf_zzzzzzzzzzzzzzzz", options: journey, environment: makeEnvironment())
         facade.perform(.screen("/", type: nil))
+        passWindow(facade)
         _ = await sent(facade)
 
         XCTAssertTrue(facade.tracker === first)
@@ -233,7 +243,10 @@ final class APITests: XCTestCase {
         facade.start(key: key, options: .init(), environment: environment)
         let tracker = await engine(of: facade)
         XCTAssertNotNil(tracker)
+        // A process that never created the application has no activation to observe.
+        tracker?.foreground(at: clock.now(), coldLaunch: true)
         facade.perform(.screen("/", type: nil))
+        passWindow(facade)
         _ = await sent(facade)
 
         let batch = try XCTUnwrap(transport.batches.first)
@@ -263,6 +276,7 @@ final class APITests: XCTestCase {
         let facade = makeFacade()
         facade.start(key: key, options: options, environment: environment)
         facade.perform(.screen("/", type: nil))
+        passWindow(facade)
         _ = await sent(facade)
         XCTAssertNil(transport.batches.first?["d"])
     }
@@ -283,6 +297,7 @@ final class APITests: XCTestCase {
         facade.start(key: key, options: .init(), environment: makeEnvironment(sdkSeen: seen))
         WrapperBridge.sdkLabel = "react-native-9.9.9"
         facade.perform(.screen("/", type: nil))
+        passWindow(facade)
         _ = await sent(facade)
         XCTAssertEqual(seen.value, ["flutter-0.3.1"], "the transport's user agent carries the label")
         XCTAssertEqual(transport.batches.first?["sv"], .string("flutter-0.3.1"), "read once, when start builds the engine")
@@ -341,6 +356,7 @@ final class APITests: XCTestCase {
 
         elapse(facade, 31 * minute)
         host.center.post(name: TestHost.names.active, object: nil)
+        passWindow(facade)
         let events = await sent(facade)
         XCTAssertEqual(events.map(\.name), ["$pageview", "$engage", "$pageview"])
         XCTAssertEqual(events.last?.landing, 1, "a return after 30 minutes lands the screen on display")
@@ -360,7 +376,7 @@ final class TestHost: PlatformHost, @unchecked Sendable {
     let center = NotificationCenter()
     private let active: Bool
 
-    init(active: Bool = false) {
+    init(active: Bool = true) {
         self.active = active
     }
 

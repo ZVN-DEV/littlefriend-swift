@@ -1,7 +1,8 @@
 import Foundation
 
 /// One stretch of using the app. It starts at a cold launch, at a return to the foreground after
-/// 30 minutes or more in the background, and when a deep link with UTM tags arrives.
+/// 30 minutes or more in the background, and when a deep link with UTM tags arrives outside a
+/// landing window.
 struct Visit: Sendable {
     /// A background at least this long ends the visit.
     static let backgroundGapMs: Int64 = 30 * 60 * 1000

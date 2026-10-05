@@ -40,7 +40,9 @@ extension LittleFriend {
     }
 
     /// A deep link or universal link that opened the app. Only its allowlisted UTM tags are read; a
-    /// link with at least one starts a new visit with that source.
+    /// link with at least one is the source of a visit. A new visit holds its screens and events for
+    /// up to 500 ms, so a link that arrives after the first screen is still that visit's source, and
+    /// a screen the link opens is its landing. A later link starts a new visit.
     public static func handle(url: URL) {
         Facade.shared.perform(.handle(url))
     }

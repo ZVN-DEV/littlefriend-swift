@@ -89,10 +89,13 @@ final class UIKitTests: XCTestCase {
         let marker = recorder.events.count
         await show(UIHostingController(rootView: Text("links").lfScreen("/links").lfDeepLinks()))
         DeepLinks.open(URL(string: "lfshop://open?utm_source=Newsletter&utm_campaign=Launch")!)
+        // Each link's visit lands when its landing window ends.
+        try await Task.sleep(nanoseconds: 700_000_000)
         let activity = NSUserActivity(activityType: NSUserActivityTypeBrowsingWeb)
         activity.webpageURL = URL(string: "https://shop.example.com/sale?utm_source=partner")!
         DeepLinks.continueActivity(activity)
         DeepLinks.continueActivity(NSUserActivity(activityType: NSUserActivityTypeBrowsingWeb))
+        try await Task.sleep(nanoseconds: 700_000_000)
         let views = await events(after: marker).filter { $0.name == "$pageview" }
 
         XCTAssertEqual(views.compactMap(\.route), ["/links", "/links", "/links"])

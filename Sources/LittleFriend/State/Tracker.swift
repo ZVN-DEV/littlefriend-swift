@@ -5,11 +5,22 @@ import Foundation
 /// `optOut()` also stops the batcher and writes the opt-out flag before it returns, so nothing is
 /// sent after it, even by a later launch.
 ///
+/// Every new visit opens a landing window: until it ends, the visit's landing is unresolved and its
+/// screen, track and consent calls are held in order, with the time of each. The window ends at a
+/// deep link with UTM tags, which becomes the visit's source, or 500 ms after the window's
+/// foreground, or when the app leaves the foreground before that. The cold visit's window opens
+/// when the tracker is created and its 500 ms run from the first foreground; a visit started by a
+/// return after 30 minutes, or by a link, opens its window at that foreground or that link. At the
+/// end the held calls replay in order: the first screen among them is the landing; with none, the
+/// screen on display from before the visit is sent as the landing at the window's end.
+///
 /// Storage, all in `storage` (Application Support/littlefriend, excluded from backup): the event
 /// queue, `session.json` in journey mode only, and the empty `opt-out` flag file.
 final class Tracker: LifecycleTarget, @unchecked Sendable {
     /// The same route again within this long is the same screen.
     static let dedupeMs: Int64 = 1000
+    /// How long a new visit waits for its deep link and its landing screen.
+    static let landingWindowMs: Int64 = 500
     /// The test clock offset may move the clock back at most this far.
     static let maxClockOffset: TimeInterval = 23 * 60 * 60
 
@@ -38,12 +49,18 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
     private var optedOut = false
     private var journey: Bool
     private var session: Session?
+    /// Nil only while the cold visit's landing window is open, and while opted out.
     private var visit: Visit?
+    /// Open while a new visit's landing is unresolved.
+    private var window: LandingWindow?
+    private var windowsOpened = 0
     private var engagement = Engagement()
     /// The screen on display: tracks are recorded under its route.
     private var route: String?
     /// The page type the screen on display was sent with.
     private var routeType: String?
+    /// The route of this visit's latest `$pageview`; nil until the visit sends one.
+    private var sentRoute: String?
     private var lastScreenAt: Int64?
     private var active = true
     private var backgroundAt: Int64?
@@ -106,15 +123,15 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
     }
 
     func screen(_ route: String, type: String?, at date: Date? = nil) {
-        serial.async { self.showScreen(route, type: type, at: date.map(self.time)) }
+        serial.async { self.screenCall(route, type: type, at: date.map(self.time)) }
     }
 
     func track(_ name: String, props: [String: PropValue], correlationId: String?, at date: Date? = nil) {
-        serial.async { self.trackEvent(name, props: props, correlationId: correlationId, at: date.map(self.time)) }
+        serial.async { self.trackCall(name, props: props, correlationId: correlationId, at: date.map(self.time)) }
     }
 
     func consent(_ consent: LittleFriend.Consent, at date: Date? = nil) {
-        serial.async { self.applyConsent(consent, at: date.map(self.time)) }
+        serial.async { self.consentCall(consent, at: date.map(self.time)) }
     }
 
     /// Stops sending at once and writes the opt-out flag before it returns: the one call that touches
@@ -170,6 +187,7 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
             return
         }
         _ = startBatcher(generation: 0)
+        openWindow(at: nil, startsVisit: true)
         if journey {
             session = sessions.load()
         } else {
@@ -203,28 +221,34 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
     }
 
     private func enterForeground(at t: Int64, coldLaunch: Bool) {
-        guard !optedOut else { return }
-        if visit == nil {
-            active = true
-            startColdVisit(at: t)
-        } else if !active {
-            active = true
-            let away = backgroundAt.map { t - $0 } ?? 0
-            if pendingSource != nil || away >= Visit.backgroundGapMs {
-                startVisit(at: t, source: pendingSource)
-                landOnShownScreen(at: t)
-            } else {
-                engagement.resume(at: t)
-            }
-        }
+        let returning = !active
+        let away = backgroundAt.map { t - $0 } ?? 0
+        active = true
         backgroundAt = nil
+        guard !optedOut else { return }
+        if let open = window {
+            // The cold visit's window, or the one opt-in opened, counts from the first foreground.
+            if open.since == nil { runWindow(from: t) }
+            return
+        }
+        guard returning else { return }
+        if pendingSource != nil || away >= Visit.backgroundGapMs {
+            startVisit(at: t, source: pendingSource)
+            openWindow(at: t)
+        } else {
+            engagement.resume(at: t)
+        }
     }
 
     private func enterBackground(at t: Int64) {
-        guard !optedOut, active else { return }
-        closeScreen(at: t)
+        guard active else { return }
+        if !optedOut {
+            if let end = window?.end { closeWindow(at: min(t, end)) }
+            closeScreen(at: t)
+        }
         active = false
         backgroundAt = t
+        guard !optedOut else { return }
         // Foreground time is activity: a live session's last activity is the moment the app left. A
         // process launched in the background has had none.
         if journey, visit != nil, var live = session, live.isLive(at: t) {
@@ -237,31 +261,32 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         }
     }
 
+    /// A link with UTM tags in an open window is the source of that window's visit and ends the
+    /// window; while active it starts a new visit with a window of its own; in the background it
+    /// waits for the next foreground.
     private func openLink(_ url: URL, at time: Int64?) {
         guard !optedOut,
               let campaign = CampaignRules.fromURL(url.absoluteString, extended: options.utmExtended)
         else { return }
-        if active, visit != nil {
-            let t = time ?? now()
+        let t = time ?? now()
+        closeWindowIfDue(by: t)
+        if window != nil {
+            closeWindow(at: t, link: campaign)
+        } else if active {
             closeScreen(at: t)
             startVisit(at: t, source: campaign)
-            landOnShownScreen(at: t)
+            openWindow(at: t)
         } else {
             pendingSource = campaign
         }
     }
 
-    private func showScreen(_ raw: String, type: String?, at time: Int64?) {
+    private func screenCall(_ raw: String, type: String?, at time: Int64?) {
         guard !optedOut else { return }
         guard let clean = Routes.clean(raw) else {
             Log.warn("a screen was dropped: its route is over 2048 characters, or over 256 once cleaned")
             return
         }
-        let t = time ?? now()
-        // A clock moved back is not within the second.
-        if clean == route, let last = lastScreenAt, t - last >= 0, t - last < Self.dedupeMs { return }
-        ensureVisit(at: t)
-        closeScreen(at: t)
         var pageType: String?
         if let type {
             if Names.validPageType(type) {
@@ -270,15 +295,16 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
                 Log.warn("a screen type was left out: it does not match ^[a-z][a-z0-9_-]{0,31}$")
             }
         }
-        sendView(clean, pageType: pageType, at: t)
+        let t = time ?? now()
+        if hold(.screen(clean, type: pageType, at: t)) { return }
+        showScreen(clean, pageType: pageType, at: t)
     }
 
-    /// A visit that starts while a screen is on display gets no appear callback for it, so that
-    /// screen's view goes out at once as the visit's landing, with the type it was sent with, and
-    /// its count starts again from `t`.
-    private func landOnShownScreen(at t: Int64) {
-        guard let shown = route else { return }
-        sendView(shown, pageType: routeType, at: t)
+    private func showScreen(_ clean: String, pageType: String?, at t: Int64) {
+        // A clock moved back is not within the second.
+        if clean == route, let last = lastScreenAt, t - last >= 0, t - last < Self.dedupeMs { return }
+        closeScreen(at: t)
+        sendView(clean, pageType: pageType, at: t)
     }
 
     /// `$pageview` for a cleaned route and a valid page type; the visit's landing when one is due.
@@ -293,18 +319,25 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         )
         route = clean
         routeType = pageType
+        sentRoute = clean
         lastScreenAt = t
         engagement.open(clean, at: t, counting: active)
     }
 
-    private func trackEvent(_ name: String, props: [String: PropValue], correlationId: String?, at time: Int64?) {
+    private func trackCall(_ name: String, props: [String: PropValue], correlationId: String?, at time: Int64?) {
         guard !optedOut else { return }
         guard Names.valid(name) else {
             Log.warn("an event was dropped: its name does not match ^[a-z][a-z0-9_.:-]{0,63}$")
             return
         }
         let t = time ?? now()
-        ensureVisit(at: t)
+        let cleaned = Props.clean(props)
+        if hold(.track(name, props: cleaned, correlationId: correlationId, at: t)) { return }
+        sendTrack(name, props: cleaned, correlationId: correlationId, at: t)
+    }
+
+    /// `props` are cleaned already.
+    private func sendTrack(_ name: String, props: [String: PropValue]?, correlationId: String?, at t: Int64) {
         var x: String?
         if journey, let id = correlationId {
             if Names.validCorrelationId(id) {
@@ -316,9 +349,94 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         // Aggregate mode: every track of the visit says it entered from outside (`l: 1`), with the
         // landing's source when the visit has one. A direct visit sends `l` alone.
         emit(
-            name, route: route ?? "/", at: t, props: Props.clean(props), landing: !journey,
+            name, route: route ?? "/", at: t, props: props, landing: !journey,
             source: journey ? nil : visit?.source, correlationId: x
         )
+    }
+
+    /// Held in an open window; consent(.none) and consent(.required) delete the session file at once
+    /// all the same.
+    private func consentCall(_ consent: LittleFriend.Consent, at time: Int64?) {
+        if consent == .journey && options.mode != .journey {
+            Log.warn("consent(.journey) is ignored: the mode option is aggregate")
+            return
+        }
+        let t = time ?? now()
+        if !optedOut, hold(.consent(consent, at: t)) {
+            if consent != .journey { sessions.delete() }
+            return
+        }
+        applyConsent(consent, at: t)
+    }
+
+    // MARK: Landing window
+
+    /// Opens a window. With `t` its 500 ms run from `t`; without, from the next foreground.
+    /// `startsVisit`: the visit itself is created when the window ends.
+    private func openWindow(at t: Int64?, startsVisit: Bool = false) {
+        window?.timer?.cancel()
+        windowsOpened += 1
+        window = LandingWindow(id: windowsOpened, startsVisit: startsVisit)
+        if let t { runWindow(from: t) }
+    }
+
+    private func runWindow(from t: Int64) {
+        guard let id = window?.id else { return }
+        window?.since = t
+        window?.timer = scheduler.schedule(after: TimeInterval(Self.landingWindowMs) / 1000) { [weak self] in
+            self?.serial.async { self?.windowTimerFired(id) }
+        }
+    }
+
+    private func windowTimerFired(_ id: Int) {
+        guard let open = window, open.id == id, let end = open.end else { return }
+        closeWindow(at: end)
+    }
+
+    /// A call made at or after the window's end finds it closed, however late its timer runs.
+    private func closeWindowIfDue(by t: Int64) {
+        if let end = window?.end, t >= end { closeWindow(at: end) }
+    }
+
+    /// Holds a call while a window is open; false when there is none. The 101st call is dropped.
+    private func hold(_ call: LandingWindow.Call) -> Bool {
+        closeWindowIfDue(by: call.time)
+        guard let open = window else { return false }
+        if open.held.count < LandingWindow.limit {
+            window?.held.append(call)
+        } else if !open.dropLogged {
+            window?.dropLogged = true
+            Log.warn("a call was dropped: at most 100 are held while a new visit's landing is settled")
+        }
+        return true
+    }
+
+    /// Ends the window at `end`. `link` is the source of its visit. The held calls replay in
+    /// order; then the screen on display, when this visit has not sent it, is the landing at `end`.
+    private func closeWindow(at end: Int64, link: Campaign? = nil) {
+        guard let closing = window else { return }
+        window = nil
+        closing.timer?.cancel()
+        if closing.startsVisit {
+            let start = min(closing.since ?? end, closing.held.first?.time ?? end)
+            if let link { startVisit(at: start, source: link) } else { startColdVisit(at: start) }
+        } else if let link, var current = visit {
+            current.source = link
+            visit = current
+            // A visit with a source ends the session; none of this visit's events went out yet.
+            session = nil
+        }
+        for call in closing.held {
+            switch call {
+            case let .screen(clean, type, t): showScreen(clean, pageType: type, at: t)
+            case let .track(name, props, correlationId, t): sendTrack(name, props: props, correlationId: correlationId, at: t)
+            case let .consent(consent, t): applyConsent(consent, at: t)
+            }
+        }
+        if active, let shown = route, shown != sentRoute {
+            closeScreen(at: end)
+            sendView(shown, pageType: routeType, at: end)
+        }
     }
 
     /// The screen open at a switch of mode is closed in the mode it was counted in, and counts on in
@@ -327,12 +445,7 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
     /// already went out in aggregate mode, that landing was the entry, so no journey screen of this
     /// visit carries `l`. consent(.none) and consent(.required) always drop the session and delete
     /// the file, even when the mode is already aggregate.
-    private func applyConsent(_ consent: LittleFriend.Consent, at time: Int64?) {
-        if consent == .journey && options.mode != .journey {
-            Log.warn("consent(.journey) is ignored: the mode option is aggregate")
-            return
-        }
-        let t = time ?? now()
+    private func applyConsent(_ consent: LittleFriend.Consent, at t: Int64) {
         if consent == .journey {
             guard !journey else { return }
             if !optedOut { closeScreen(at: t) }
@@ -363,11 +476,13 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         sessions.delete()
         session = nil
         visit = nil
+        window?.timer?.cancel()
+        window = nil
         engagement.clear()
         route = nil
         routeType = nil
+        sentRoute = nil
         lastScreenAt = nil
-        backgroundAt = nil
         pendingSource = nil
     }
 
@@ -402,23 +517,22 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         lock.unlock()
         guard current else { return }
         optedOut = false
-        // The next foreground or screen starts a new visit, and in journey mode a new session.
+        // A new visit, and in journey mode a new session, with a window of its own: counting from
+        // now in the foreground, else from the next foreground.
         _ = startBatcher(generation: generation)
+        openWindow(at: active ? now() : nil, startsVisit: true)
     }
 
-    private func ensureVisit(at t: Int64) {
-        if visit == nil { startColdVisit(at: t) }
-    }
-
-    /// A cold launch is a new visit unless, in journey mode with no deep link, a live session
-    /// continues: then its landing is still due only when the session's first screen was never sent.
+    /// A cold launch with no deep link continues a live journey session: then its landing is still
+    /// due only when the session's first screen was never sent. Otherwise it is a new visit.
     private func startColdVisit(at t: Int64) {
-        if journey, pendingSource == nil, let live = session, live.isLive(at: t) {
+        if journey, let live = session, live.isLive(at: t) {
             visit = Visit(source: nil, landingPending: !live.entered)
             engagement.clear()
             lastScreenAt = nil
+            sentRoute = nil
         } else {
-            startVisit(at: t, source: pendingSource)
+            startVisit(at: t, source: nil)
         }
     }
 
@@ -430,6 +544,7 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         pendingSource = nil
         engagement.clear()
         lastScreenAt = nil
+        sentRoute = nil
         if source != nil {
             session = nil
         } else if let current = session, !current.isLive(at: t) {
@@ -473,4 +588,31 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         }
         currentBatcher()?.enqueue(queued)
     }
+}
+
+/// A new visit's landing window. Its calls are held until it ends.
+private struct LandingWindow {
+    static let limit = 100
+
+    enum Call {
+        case screen(String, type: String?, at: Int64)
+        case track(String, props: [String: PropValue]?, correlationId: String?, at: Int64)
+        case consent(LittleFriend.Consent, at: Int64)
+
+        var time: Int64 {
+            switch self {
+            case let .screen(_, _, t), let .track(_, _, _, t), let .consent(_, t): return t
+            }
+        }
+    }
+
+    let id: Int
+    let startsVisit: Bool
+    /// The window's foreground: the 500 ms run from it. Nil until then.
+    var since: Int64?
+    var timer: ScheduledWork?
+    var held: [Call] = []
+    var dropLogged = false
+
+    var end: Int64? { since.map { $0 + Tracker.landingWindowMs } }
 }

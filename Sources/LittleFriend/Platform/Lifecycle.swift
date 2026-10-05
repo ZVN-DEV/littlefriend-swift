@@ -247,12 +247,15 @@ struct LiveHost: PlatformHost {
 
 #else
 
-/// No lifecycle: the first call starts the visit.
+/// No lifecycle: the start is the cold launch foreground.
 struct LiveHost: PlatformHost {
     var platform: String { "ios" }
     func onMain(_ work: @escaping @Sendable () -> Void) { work() }
     func device() -> String { "mobile" }
-    func attach(_ tracker: Tracker, clock: Clock, autoScreens: Bool) -> AnyObject? { nil }
+    func attach(_ tracker: Tracker, clock: Clock, autoScreens: Bool) -> AnyObject? {
+        tracker.foreground(at: clock.now(), coldLaunch: true)
+        return nil
+    }
 }
 
 #endif
