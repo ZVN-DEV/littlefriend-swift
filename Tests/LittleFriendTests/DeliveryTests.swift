@@ -95,7 +95,7 @@ final class DeliveryTests: XCTestCase {
     }
 
     private func line(_ e: QueuedEvent) throws -> Data {
-        try JSONEncoder().encode(e) + Data("\n".utf8)
+        try XCTUnwrap(e.json()) + Data("\n".utf8)
     }
 
     // MARK: Batch shape
@@ -143,7 +143,7 @@ final class DeliveryTests: XCTestCase {
         XCTAssertEqual(props["page_type"] as? String, "product")
         XCTAssertEqual(props["price"] as? Double, 12.5)
         XCTAssertEqual(props["member"] as? Bool, true)
-        XCTAssertEqual(request.batch?.e, [e.event])
+        XCTAssertEqual(request.events, [e.event])
         // Slashes are not escaped, so routes cost their own length in the byte budget.
         XCTAssertTrue(String(decoding: request.body, as: UTF8.self).contains("\"u\":\"/products/:id\""))
         XCTAssertEqual(queue.count, 0)
@@ -259,14 +259,13 @@ final class DeliveryTests: XCTestCase {
         let sent = stub.requests
         XCTAssertGreaterThan(sent.count, 1)
         XCTAssertEqual(sent.flatMap(\.ids), ids(events))
-        let encoder = WireJSON.encoder()
         var offset = 0
         for (index, request) in sent.enumerated() {
             XCTAssertLessThanOrEqual(request.body.count, 15_000)
             offset += request.ids.count
             if index < sent.count - 1 {
                 // The cut is tight: the next event would have pushed this body past 15,000 bytes.
-                let next = try encoder.encode(events[offset].event).count
+                let next = try XCTUnwrap(events[offset].event.json()).count
                 XCTAssertGreaterThan(request.body.count + 1 + next, 15_000)
             }
         }
@@ -275,10 +274,9 @@ final class DeliveryTests: XCTestCase {
     /// An event whose encoded size is exactly `size` bytes, padded through its route.
     private func event(_ seq: Int, encodedSize size: Int) throws -> QueuedEvent {
         var e = event(seq)
-        let encoder = WireJSON.encoder()
-        let base = try encoder.encode(e.event).count
+        let base = try XCTUnwrap(e.event.json()).count
         e.event.u += String(repeating: "a", count: size - base)
-        XCTAssertEqual(try encoder.encode(e.event).count, size)
+        XCTAssertEqual(e.event.json()?.count, size)
         return e
     }
 
@@ -291,7 +289,7 @@ final class DeliveryTests: XCTestCase {
             queue.clear()
             let events = try (0..<20).map { try event($0, encodedSize: 700) }
             let wire = WireBatch(k: key, m: "a", sv: sdk, a: app, e: events.map(\.event))
-            let twenty = try WireJSON.encoder().encode(wire).count
+            let twenty = try XCTUnwrap(wire.json()).count
             // The 21st event fills the body to exactly 15,000 bytes, comma included, or one byte past.
             let last = try event(20, encodedSize: 15_000 - twenty - 1 + spare)
             (events + [last]).forEach(queue.append)
@@ -620,7 +618,7 @@ final class DeliveryTests: XCTestCase {
 
     func testAHalfWrittenLineAndAGarbageLineLoadTheGoodLines() throws {
         let good = [event(0), event(1), event(2)]
-        var future = try JSONSerialization.jsonObject(with: JSONEncoder().encode(good[2])) as! [String: Any]
+        var future = try JSONSerialization.jsonObject(with: XCTUnwrap(good[2].json())) as! [String: Any]
         future["added_later"] = ["x": 1]
         var data = try line(good[0])
         data += Data([0xFF, 0x00, 0xFE]) + Data("not json\n".utf8)
@@ -757,7 +755,7 @@ final class DeliveryTests: XCTestCase {
 
     func testAQueueLineWithoutTheTestFlagLoadsAsRealTraffic() async throws {
         let old = event(0)
-        var object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(old)) as! [String: Any]
+        var object = try JSONSerialization.jsonObject(with: XCTUnwrap(old.json())) as! [String: Any]
         object["test"] = nil
         try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
         try (JSONSerialization.data(withJSONObject: object) + Data("\n".utf8)).write(to: file)

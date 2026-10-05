@@ -2,7 +2,7 @@ import Foundation
 
 /// Campaign fields as the wire carries them: utm_source, utm_medium, utm_campaign, and, only when the
 /// project allowlists them, utm_term and utm_content.
-struct Campaign: Codable, Equatable, Sendable {
+struct Campaign: JSONWritable, Equatable, Sendable {
     var s: String?
     var m: String?
     var c: String?
@@ -15,6 +15,25 @@ struct Campaign: Codable, Equatable, Sendable {
         self.c = c
         self.t = t
         self.n = n
+    }
+
+    init?(json value: Any) {
+        guard let f = value as? [String: Any],
+              let s = JSON.optional(f["s"], JSON.string), let m = JSON.optional(f["m"], JSON.string),
+              let c = JSON.optional(f["c"], JSON.string), let t = JSON.optional(f["t"], JSON.string),
+              let n = JSON.optional(f["n"], JSON.string)
+        else { return nil }
+        self.init(s: s, m: m, c: c, t: t, n: n)
+    }
+
+    func write(to json: inout JSONWriter) {
+        json.beginObject()
+        json.field("s", s)
+        json.field("m", m)
+        json.field("c", c)
+        json.field("t", t)
+        json.field("n", n)
+        json.endObject()
     }
 }
 

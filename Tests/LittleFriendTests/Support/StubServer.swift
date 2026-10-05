@@ -24,8 +24,14 @@ final class StubServer: @unchecked Sendable {
             (try? JSONSerialization.jsonObject(with: body)) as? [String: Any] ?? [:]
         }
 
-        var batch: WireBatch? { try? JSONDecoder().decode(WireBatch.self, from: body) }
-        var ids: [String] { batch?.e.map(\.i) ?? [] }
+        /// The body's events, read back as a queue line holds them.
+        var events: [WireEvent]? {
+            guard let items = JSON.object(body)?["e"] as? [Any] else { return nil }
+            let events = items.compactMap { WireEvent(json: $0) }
+            return events.count == items.count ? events : nil
+        }
+
+        var ids: [String] { events?.map(\.i) ?? [] }
 
         /// Header lookup ignoring case.
         func header(_ name: String) -> String? {

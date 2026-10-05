@@ -2,7 +2,7 @@ import Foundation
 import Security
 
 /// A journey session, as `session.json` holds it. Times are epoch milliseconds on the SDK clock.
-struct Session: Codable, Equatable, Sendable {
+struct Session: JSONWritable, Equatable, Sendable {
     static let idleMs: Int64 = 30 * 60 * 1000
     static let maxMs: Int64 = 24 * 60 * 60 * 1000
 
@@ -21,6 +21,17 @@ struct Session: Codable, Equatable, Sendable {
         t >= start && t - last < Self.idleMs && t - start < Self.maxMs
     }
 
+    func write(to json: inout JSONWriter) {
+        json.beginObject()
+        json.field("id", id)
+        json.field("start", start)
+        json.field("last", last)
+        json.field("seq", seq)
+        json.key("entered")
+        json.bool(entered)
+        json.endObject()
+    }
+
     /// SESSION_ID_RE `^[A-Za-z0-9_-]{16,32}$`, times in order and a sequence number that is not negative.
     var isWellFormed: Bool {
         let u = Array(id.utf16)
@@ -28,6 +39,18 @@ struct Session: Codable, Equatable, Sendable {
             && u.allSatisfy { Text.isAlnum($0) || $0 == 0x5F || $0 == 0x2D }
             && start <= last
             && seq >= 0
+    }
+}
+
+extension Session {
+    /// The file's object, or nil when a field is missing or has the wrong type.
+    init?(json data: Data) {
+        guard let f = JSON.object(data),
+              let id = f["id"].flatMap(JSON.string), let start = f["start"].flatMap(JSON.int64),
+              let last = f["last"].flatMap(JSON.int64), let seq = f["seq"].flatMap(JSON.int),
+              let entered = f["entered"].flatMap(JSON.bool)
+        else { return nil }
+        self.init(id: id, start: start, last: last, seq: seq, entered: entered)
     }
 }
 
@@ -40,7 +63,6 @@ final class SessionStore {
 
     let fileURL: URL
     private let directory: URL
-    private let encoder = JSONEncoder()
     /// False after a read error, until the file is deleted: saves skip a file this process cannot see.
     private var onDisk = true
 
@@ -60,7 +82,7 @@ final class SessionStore {
             Log.warn("the session file could not be read; this launch starts without it")
             return nil
         }
-        if let session = try? JSONDecoder().decode(Session.self, from: data), session.isWellFormed {
+        if let session = Session(json: data), session.isWellFormed {
             return session
         }
         Log.warn("the session file could not be decoded and was deleted")
@@ -73,7 +95,8 @@ final class SessionStore {
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             excludeFromBackup(directory)
-            try encoder.encode(session).write(to: fileURL, options: .atomic)
+            guard let data = session.json() else { return }
+            try data.write(to: fileURL, options: .atomic)
             // An atomic write replaces the file, so its backup exclusion is set again.
             excludeFromBackup(fileURL)
         } catch {

@@ -26,7 +26,6 @@ final class Batcher: @unchecked Sendable {
     private let test: Bool
     private let scheduler: Scheduler
     private let serial = DispatchQueue(label: "io.littlefriend.batcher")
-    private let encoder = WireJSON.encoder()
 
     // Read and written on `serial` only.
     private var timer: ScheduledWork?
@@ -142,7 +141,7 @@ final class Batcher: @unchecked Sendable {
         guard let first = batch.first else { return finish() }
         let ids = Set(batch.map(\.event.i))
         let wire = envelope(for: first, events: batch.map(\.event))
-        guard let body = try? encoder.encode(wire) else {
+        guard let body = wire.json() else {
             // Values the queue accepted always encode; dropping keeps a cycle from repeating forever.
             Log.warn("a batch of \(batch.count) events could not be encoded and was dropped")
             queue.remove(ids: ids)
@@ -205,6 +204,6 @@ final class Batcher: @unchecked Sendable {
     }
 
     private func envelopeSize(for first: QueuedEvent) -> Int {
-        (try? encoder.encode(envelope(for: first, events: [])).count) ?? 0
+        envelope(for: first, events: []).json()?.count ?? 0
     }
 }

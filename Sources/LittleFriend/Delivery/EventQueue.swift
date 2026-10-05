@@ -2,7 +2,7 @@ import Foundation
 
 /// An event waiting in the file queue, with the mode, session and test flag its batch must carry.
 /// A queue line is {"event", "mode", "session"?, "test"}; a line without "test" is real traffic.
-struct QueuedEvent: Codable, Sendable, Equatable {
+struct QueuedEvent: JSONWritable, Sendable, Equatable {
     var event: WireEvent
     /// "a" (aggregate) or "j" (journey).
     var mode: String
@@ -11,16 +11,27 @@ struct QueuedEvent: Codable, Sendable, Equatable {
     /// Test traffic: its batch carries `d: 1`, whatever the process sending it was started with.
     var test = false
 
-    private enum CodingKeys: String, CodingKey { case event, mode, session, test }
+    func write(to json: inout JSONWriter) {
+        json.beginObject()
+        json.field("event", event)
+        json.field("mode", mode)
+        json.field("session", session)
+        json.key("test")
+        json.bool(test)
+        json.endObject()
+    }
 }
 
 extension QueuedEvent {
-    init(from decoder: Decoder) throws {
-        let c = try decoder.container(keyedBy: CodingKeys.self)
-        event = try c.decode(WireEvent.self, forKey: .event)
-        mode = try c.decode(String.self, forKey: .mode)
-        session = try c.decodeIfPresent(String.self, forKey: .session)
-        test = try c.decodeIfPresent(Bool.self, forKey: .test) ?? false
+    /// A queue line, or nil when it is not one.
+    init?(json data: Data) {
+        guard let f = JSON.object(data),
+              let event = f["event"].flatMap(WireEvent.init(json:)),
+              let mode = f["mode"].flatMap(JSON.string),
+              let session = JSON.optional(f["session"], JSON.string),
+              let test = JSON.optional(f["test"], JSON.bool)
+        else { return nil }
+        self.init(event: event, mode: mode, session: session, test: test ?? false)
     }
 }
 
@@ -38,7 +49,6 @@ final class EventQueue: @unchecked Sendable {
     private let directory: URL
     private let clock: Clock
     private let serial = DispatchQueue(label: "io.littlefriend.queue")
-    private let encoder = WireJSON.encoder()
     private var entries: [Entry] = []
     /// False when the directory or the file could not be read: a file this process cannot see is
     /// never overwritten, and events are kept in memory only.
@@ -157,7 +167,7 @@ final class EventQueue: @unchecked Sendable {
     private enum EntryError: Error {
         /// A mode other than "a" or "j".
         case unknownMode
-        /// JSONEncoder refused a value, such as a number that is not finite.
+        /// A number that is not finite: JSON has none.
         case unencodable
     }
 
@@ -169,7 +179,7 @@ final class EventQueue: @unchecked Sendable {
         case "j": break
         default: return .failure(.unknownMode)
         }
-        guard let line = try? encoder.encode(queued), let size = try? encoder.encode(queued.event).count else {
+        guard let line = queued.json(), let size = queued.event.json()?.count else {
             return .failure(.unencodable)
         }
         return .success(Entry(queued: queued, line: line, size: size))
@@ -195,11 +205,10 @@ final class EventQueue: @unchecked Sendable {
             Log.warn("the event queue file could not be read; events are kept in memory only")
             return
         }
-        let decoder = JSONDecoder()
         let now = clock.nowMs()
         var dirty = !data.isEmpty && data.last != 0x0A
         for line in data.split(separator: 0x0A) {
-            guard let decoded = try? decoder.decode(QueuedEvent.self, from: Data(line)),
+            guard let decoded = QueuedEvent(json: Data(line)),
                   case let .success(entry) = makeEntry(decoded),
                   Self.inWindow(entry.queued.event.t, now: now)
             else {
