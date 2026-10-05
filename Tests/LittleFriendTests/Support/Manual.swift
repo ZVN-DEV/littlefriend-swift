@@ -2,7 +2,7 @@ import Foundation
 @testable import LittleFriend
 
 /// A clock that moves only when a test moves it.
-final class ManualClock: LittleFriend.Clock, @unchecked Sendable {
+final class ManualClock: Clock, @unchecked Sendable {
     private let lock = NSLock()
     private var current: Date
 

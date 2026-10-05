@@ -12,8 +12,23 @@ struct SystemClock: Clock {
 extension Clock {
     /// Epoch milliseconds, as event timestamps carry them.
     func nowMs() -> Int64 {
-        Int64((now().timeIntervalSince1970 * 1000).rounded(.down))
+        now().epochMs
     }
+}
+
+extension Date {
+    /// Epoch milliseconds, rounded down.
+    var epochMs: Int64 {
+        Int64((timeIntervalSince1970 * 1000).rounded(.down))
+    }
+}
+
+/// Another clock moved by a fixed offset: the test clock offset.
+struct OffsetClock: Clock {
+    let base: Clock
+    let offset: TimeInterval
+
+    func now() -> Date { base.now().addingTimeInterval(offset) }
 }
 
 /// Work that a scheduler will run unless it is cancelled first.

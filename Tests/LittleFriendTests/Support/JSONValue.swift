@@ -36,6 +36,14 @@ enum JSONValue: Decodable, Equatable {
         return nil
     }
 
+    var number: Double? {
+        if case let .number(d) = self { return d }
+        return nil
+    }
+
+    /// A number with no fractional part.
+    var int: Int? { number.flatMap { Int(exactly: $0) } }
+
     var isNull: Bool { self == .null }
 
     /// A short form for failure messages: long inputs are cut, with their length.
