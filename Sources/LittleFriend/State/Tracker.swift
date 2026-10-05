@@ -161,10 +161,12 @@ final class Tracker: @unchecked Sendable {
         _ = startBatcher(generation: 0)
         if journey {
             session = sessions.load()
-        } else if options.mode == .aggregate {
-            sessions.delete()
-        } else if let stored = sessions.load(), !stored.isLive(at: now()) {
-            // Waiting for consent runs in aggregate mode: only a session consent could still continue stays.
+        } else {
+            // The file exists only in journey mode. Waiting for consent keeps a live session in
+            // memory, for consent(.journey) to continue.
+            if options.mode == .journey {
+                session = sessions.load().flatMap { $0.isLive(at: now()) ? $0 : nil }
+            }
             sessions.delete()
         }
     }
@@ -290,33 +292,36 @@ final class Tracker: @unchecked Sendable {
         )
     }
 
-    /// The screen open at the switch is closed in the mode it was counted in, and counts on in the
-    /// new one. A switch to journey continues the visit: when its landing already went out in
-    /// aggregate mode, that landing was the entry, so the session's first screen carries no `l`.
+    /// The screen open at a switch of mode is closed in the mode it was counted in, and counts on in
+    /// the new one. A switch to journey continues the visit, and the session held in memory when it
+    /// is still live; otherwise a new session starts with the next event. When the visit's landing
+    /// already went out in aggregate mode, that landing was the entry, so no journey screen of this
+    /// visit carries `l`. consent(.none) and consent(.required) always drop the session and delete
+    /// the file, even when the mode is already aggregate.
     private func applyConsent(_ consent: LittleFriend.Consent) {
         if consent == .journey && options.mode != .journey {
             Log.warn("consent(.journey) is ignored: the mode option is aggregate")
             return
         }
-        let wantJourney = consent == .journey
-        guard wantJourney != journey else { return }
         let t = now()
-        if !optedOut { closeScreen(at: t) }
-        if wantJourney {
+        if consent == .journey {
+            guard !journey else { return }
+            if !optedOut { closeScreen(at: t) }
             journey = true
-            session = sessions.load().flatMap { $0.isLive(at: t) ? $0 : nil }
-            if var current = visit {
-                if current.source != nil {
-                    // A visit with a source is a new session.
-                    session = nil
-                } else if current.landingPending, let live = session {
-                    // Before the landing a live session continues, as it would have at launch.
+            if let held = session, !held.isLive(at: t) { session = nil }
+            if let live = session {
+                sessions.save(live)
+                if var current = visit, current.landingPending {
+                    // Before the landing a live session continues as it would have at launch.
                     current.landingPending = !live.entered
                     visit = current
                 }
             }
         } else {
-            journey = false
+            if journey {
+                if !optedOut { closeScreen(at: t) }
+                journey = false
+            }
             session = nil
             sessions.delete()
         }

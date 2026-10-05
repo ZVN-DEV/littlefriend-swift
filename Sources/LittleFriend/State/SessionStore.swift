@@ -32,7 +32,8 @@ struct Session: Codable, Equatable, Sendable {
 }
 
 /// `session.json` inside the SDK directory: written atomically on every change, excluded from
-/// backup, deleted when it cannot be read. Used on the tracker's queue only.
+/// backup. A file that was read but does not decode is deleted; one that could not be read is kept
+/// and never written over for the rest of the process. Used on the tracker's queue only.
 final class SessionStore {
     private static let alphabet = Array("abcdefghijklmnopqrstuvwxyz234567".unicodeScalars)
     static let idLength = 20
@@ -40,26 +41,35 @@ final class SessionStore {
     let fileURL: URL
     private let directory: URL
     private let encoder = JSONEncoder()
+    /// False after a read error, until the file is deleted: saves skip a file this process cannot see.
+    private var onDisk = true
 
     init(directory: URL) {
         self.directory = directory
         fileURL = directory.appendingPathComponent("session.json")
     }
 
-    /// The stored session, or nil. A file that does not decode to a well-formed session is deleted.
+    /// The stored session, or nil.
     func load() -> Session? {
         guard FileManager.default.fileExists(atPath: fileURL.path) else { return nil }
-        if let data = try? Data(contentsOf: fileURL),
-           let session = try? JSONDecoder().decode(Session.self, from: data),
-           session.isWellFormed {
+        let data: Data
+        do {
+            data = try Data(contentsOf: fileURL)
+        } catch {
+            onDisk = false
+            Log.warn("the session file could not be read; this launch starts without it")
+            return nil
+        }
+        if let session = try? JSONDecoder().decode(Session.self, from: data), session.isWellFormed {
             return session
         }
-        Log.warn("the session file could not be read and was deleted")
+        Log.warn("the session file could not be decoded and was deleted")
         delete()
         return nil
     }
 
     func save(_ session: Session) {
+        guard onDisk else { return }
         do {
             try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
             excludeFromBackup(directory)
@@ -71,10 +81,15 @@ final class SessionStore {
         }
     }
 
+    /// Deletes the file, even one this process could not read.
     func delete() {
-        guard FileManager.default.fileExists(atPath: fileURL.path) else { return }
+        guard FileManager.default.fileExists(atPath: fileURL.path) else {
+            onDisk = true
+            return
+        }
         do {
             try FileManager.default.removeItem(at: fileURL)
+            onDisk = true
         } catch {
             Log.warn("the session file could not be deleted")
         }

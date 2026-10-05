@@ -465,6 +465,28 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(try readSession()["id"] as? String, events.first?.session)
     }
 
+    func testASessionFileThatCannotBeReadIsKeptAndNotOverwritten() async throws {
+        let log = LogCapture()
+        defer { log.stop() }
+        try writeSession(id: "abcdefghij234567abcd", start: clock.now() - 60, last: clock.now() - 60, seq: 4, entered: true)
+        let bytes = try Data(contentsOf: sessionFile)
+        try FileManager.default.setAttributes([.posixPermissions: 0], ofItemAtPath: sessionFile.path)
+        defer { try? FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: sessionFile.path) }
+        let tracker = makeTracker(journey)
+        tracker.foreground(at: clock.now(), coldLaunch: true)
+        tracker.screen("/", type: nil)
+        tracker.track("signup", props: [:], correlationId: nil)
+        let events = await sent(tracker)
+
+        XCTAssertEqual(events.map(\.seq), [1, 2], "this launch runs a session of its own")
+        XCTAssertNotEqual(events.first?.session, "abcdefghij234567abcd")
+        XCTAssertEqual(events.first?.landing, 1)
+        XCTAssertTrue(exists(sessionFile), "a read error keeps the file")
+        try FileManager.default.setAttributes([.posixPermissions: 0o644], ofItemAtPath: sessionFile.path)
+        XCTAssertEqual(try Data(contentsOf: sessionFile), bytes, "and never writes over it")
+        XCTAssertEqual(log.lines.filter { $0.contains("session file") }.count, 1, log.lines.joined(separator: "\n"))
+    }
+
     func testAWrongShapedSessionFileStartsANewSession() async throws {
         let live = clock.now() - 60
         let shapes: [[String: Any]] = [
@@ -639,22 +661,86 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(events.map(\.landing), [nil], "a relaunch that continues a session is not a new visit")
     }
 
-    func testWaitingForConsentKeepsOnlyALiveSessionFile() async throws {
+    func testWaitingForConsentKeepsNoSessionFile() async throws {
         let required: (inout LittleFriend.Options) -> Void = {
             $0.mode = .journey
             $0.consent = .required
         }
         try writeSession(id: "abcdefghij234567abcd", start: clock.now() - 300, last: clock.now() - 60, seq: 2, entered: true)
         makeTracker(required).drain()
-        XCTAssertTrue(exists(sessionFile), "a live session may still continue once consent arrives")
+        XCTAssertFalse(exists(sessionFile), "a live session waits in memory only")
 
         try writeSession(id: "abcdefghij234567abcd", start: clock.now() - 3 * hour, last: clock.now() - 31 * minute, seq: 2, entered: true)
         makeTracker(required).drain()
-        XCTAssertFalse(exists(sessionFile), "aggregate mode keeps no session that can no longer continue")
+        XCTAssertFalse(exists(sessionFile))
 
         try writeSession(id: "abcdefghij234567abcd", start: clock.now() - 300, last: clock.now() - 60, seq: 2, entered: true)
         makeTracker().drain()
         XCTAssertFalse(exists(sessionFile), "an aggregate mode app keeps none at all")
+    }
+
+    func testConsentContinuesTheSessionALaunchThatWaitedHeldInMemory() async throws {
+        let id = "abcdefghij234567abcd"
+        try writeSession(id: id, start: clock.now() - 300, last: clock.now() - 60, seq: 7, entered: true)
+        let tracker = makeTracker {
+            $0.mode = .journey
+            $0.consent = .required
+        }
+        tracker.foreground(at: clock.now(), coldLaunch: true)
+        tracker.screen("/a", type: nil)
+        tracker.drain()
+        XCTAssertFalse(exists(sessionFile), "no session file while the mode is aggregate")
+        elapse(5 * minute)
+        tracker.consent(.journey)
+        tracker.drain()
+        XCTAssertEqual(try readSession()["id"] as? String, id, "journey mode writes it back")
+        tracker.screen("/b", type: nil)
+        let events = await sent(tracker)
+
+        XCTAssertEqual(events.map(\.name), ["$pageview", "$engage", "$pageview"])
+        guard events.count == 3 else { return }
+        XCTAssertEqual(events.map(\.mode), ["a", "a", "j"])
+        XCTAssertEqual(events[2].session, id, "5 minutes later the session is still live and continues")
+        XCTAssertEqual(events[2].seq, 8)
+        XCTAssertNil(events[2].landing)
+        XCTAssertEqual(try readSession()["seq"] as? Int, 8)
+    }
+
+    func testConsentWithdrawnOrRequiredDeletesTheSessionFile() async throws {
+        for withdrawn in [LittleFriend.Consent.none, .required] {
+            let tracker = makeTracker(storage: root.appendingPathComponent("\(withdrawn)"), journey)
+            let file = root.appendingPathComponent("\(withdrawn)").appendingPathComponent("session.json")
+            tracker.foreground(at: clock.now(), coldLaunch: true)
+            tracker.screen("/", type: nil)
+            tracker.drain()
+            XCTAssertTrue(exists(file))
+            tracker.consent(withdrawn)
+            tracker.drain()
+            XCTAssertFalse(exists(file), "consent(.\(withdrawn)) deletes the session file")
+            tracker.screen("/a", type: nil)
+            tracker.drain()
+            XCTAssertFalse(exists(file), "and aggregate mode writes none")
+        }
+    }
+
+    func testConsentNoneWhileWaitingDropsTheSessionInMemory() async throws {
+        let id = "abcdefghij234567abcd"
+        try writeSession(id: id, start: clock.now() - 300, last: clock.now() - 60, seq: 7, entered: true)
+        let tracker = makeTracker {
+            $0.mode = .journey
+            $0.consent = .required
+        }
+        tracker.foreground(at: clock.now(), coldLaunch: true)
+        tracker.consent(.none)
+        tracker.consent(.journey)
+        tracker.screen("/a", type: nil)
+        let events = await sent(tracker)
+
+        XCTAssertEqual(events.count, 1)
+        XCTAssertEqual(events.first?.mode, "j")
+        XCTAssertNotEqual(events.first?.session, id, "consent(.none) dropped the session the launch held")
+        XCTAssertEqual(events.first?.seq, 1)
+        XCTAssertEqual(events.first?.landing, 1)
     }
 
     func testConsentWithdrawnStopsTheSessionAndContinuesInAggregate() async throws {
