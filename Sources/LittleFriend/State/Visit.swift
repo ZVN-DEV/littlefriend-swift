@@ -15,6 +15,4 @@ struct Visit: Sendable {
     var coldLaunch: Bool
     /// A screen has been sent in this visit.
     var screened = false
-    /// The `ms` of every `$engage` sent in this visit: the next one's `sum` adds its own `ms`.
-    var engagedMs: Int64 = 0
 }

@@ -392,16 +392,15 @@ final class Tracker: @unchecked Sendable {
         if let current = session, !current.isLive(at: t) { session = nil }
     }
 
-    /// Sends `$engage` for the open screen when it counted at least a second.
+    /// Sends `$engage` for the open screen when it counted at least a second. `sum` is the screen's
+    /// running total, this event included.
     private func closeScreen(at t: Int64) {
-        guard let open = engagement.route, var current = visit else { return }
+        guard let open = engagement.route, visit != nil else { return }
         let ms = engagement.take(at: t)
-        guard ms >= Engagement.minMs else { return }
-        current.engagedMs += ms
-        visit = current
+        guard ms > 0 else { return }
         emit(
             "$engage", route: open, at: t,
-            props: ["ms": .number(Double(ms)), "sum": .number(Double(current.engagedMs))], past: true
+            props: ["ms": .number(Double(ms)), "sum": .number(Double(engagement.emitted))], past: true
         )
     }
 

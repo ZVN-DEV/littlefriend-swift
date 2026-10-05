@@ -675,29 +675,73 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(engages(events).map(\.route), ["/a", "/c"])
         XCTAssertEqual(engages(events).map(\.props), [
             ["ms": .number(4000), "sum": .number(4000)],
-            ["ms": .number(2000), "sum": .number(6000)],
+            ["ms": .number(2000), "sum": .number(2000)],
         ])
     }
 
-    func testANewVisitStartsTheRunningTotalAgain() async throws {
+    func testSumIsTheScreensRunningTotal() async throws {
         let tracker = makeTracker()
         tracker.foreground(at: clock.now(), coldLaunch: true)
         tracker.screen("/a", type: nil)
-        elapse(5)
-        tracker.background(at: clock.now())
-        elapse(31 * minute)
-        tracker.foreground(at: clock.now(), coldLaunch: false)
-        elapse(20)
+        elapse(4)
         tracker.screen("/b", type: nil)
-        elapse(2)
+        elapse(8)
+        tracker.screen("/c", type: nil)
+        elapse(30)
+        tracker.screen("/d", type: nil)
+        let events = await sent(tracker)
+
+        XCTAssertEqual(engages(events).map(\.route), ["/a", "/b", "/c"])
+        XCTAssertEqual(engages(events).map(\.props), [
+            ["ms": .number(4000), "sum": .number(4000)],
+            ["ms": .number(8000), "sum": .number(8000)],
+            ["ms": .number(30000), "sum": .number(30000)],
+        ], "each screen starts its own total")
+    }
+
+    func testSumRunsOnForTheSameScreenAcrossABackgroundPause() async throws {
+        let tracker = makeTracker()
+        tracker.foreground(at: clock.now(), coldLaunch: true)
+        tracker.screen("/a", type: nil)
+        elapse(12)
+        tracker.background(at: clock.now())
+        elapse(2 * minute)
+        tracker.foreground(at: clock.now(), coldLaunch: false)
+        elapse(15)
+        tracker.screen("/b", type: nil)
+        let events = await sent(tracker)
+
+        XCTAssertEqual(engages(events).map(\.route), ["/a", "/a"])
+        XCTAssertEqual(engages(events).map(\.props), [
+            ["ms": .number(12000), "sum": .number(12000)],
+            ["ms": .number(15000), "sum": .number(27000)],
+        ])
+    }
+
+    func testTheCapHoldsForOneScreenAcrossBackgroundPauses() async throws {
+        let tracker = makeTracker()
+        tracker.foreground(at: clock.now(), coldLaunch: true)
+        tracker.screen("/a", type: nil)
+        elapse(20 * minute)
+        tracker.background(at: clock.now())
+        elapse(1 * minute)
+        tracker.foreground(at: clock.now(), coldLaunch: false)
+        elapse(20 * minute)
+        tracker.background(at: clock.now())
+        elapse(1 * minute)
+        tracker.foreground(at: clock.now(), coldLaunch: false)
+        elapse(5 * minute)
+        tracker.screen("/b", type: nil)
+        elapse(3)
         tracker.screen("/c", type: nil)
         let events = await sent(tracker)
 
-        XCTAssertEqual(engages(events).map(\.route), ["/a", "/b"], "no count before the new visit's landing")
+        XCTAssertEqual(engages(events).map(\.route), ["/a", "/a", "/b"], "nothing past the cap on /a")
         XCTAssertEqual(engages(events).map(\.props), [
-            ["ms": .number(5000), "sum": .number(5000)],
-            ["ms": .number(2000), "sum": .number(2000)],
-        ])
+            ["ms": .number(1_200_000), "sum": .number(1_200_000)],
+            ["ms": .number(600_000), "sum": .number(1_800_000)],
+            ["ms": .number(3000), "sum": .number(3000)],
+        ], "30 minutes for the screen in all, then a new screen counts afresh")
     }
 
     // MARK: Opt-out
