@@ -481,7 +481,9 @@ final class DeliveryTests: XCTestCase {
         _ = await stub.waitForRequests(1)
         let during = (1...9).map { event($0) }
         during.forEach(batcher.enqueue)
-        XCTAssertEqual(scheduler.pendingDelays, [1], "only the retry waits while a cycle runs")
+        // The retry is scheduled once the 503 is read, which may come after the enqueues.
+        let pending = await scheduler.waitForPending()
+        XCTAssertEqual(pending, [1], "only the retry waits while a cycle runs")
         for attempt in 1...3 {
             let delays = await scheduler.waitForPending()
             scheduler.advance(by: delays.first ?? 0)
