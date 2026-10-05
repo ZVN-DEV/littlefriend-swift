@@ -383,13 +383,19 @@ final class Tracker: @unchecked Sendable {
         }
     }
 
-    /// The next screen is the landing. Nothing counts toward `$engage` until it.
+    /// The next screen is the landing. Nothing counts toward `$engage` until it. A visit with a
+    /// source ends the session, so its landing is the entry of a new one; without a source a live
+    /// session goes on.
     private func startVisit(at t: Int64, source: Campaign?, coldLaunch: Bool) {
         visit = Visit(source: source, landingPending: true, coldLaunch: coldLaunch)
         pendingSource = nil
         engagement.clear()
         lastScreenAt = nil
-        if let current = session, !current.isLive(at: t) { session = nil }
+        if source != nil {
+            session = nil
+        } else if let current = session, !current.isLive(at: t) {
+            session = nil
+        }
     }
 
     /// Sends `$engage` for the open screen when it counted at least a second. `sum` is the screen's

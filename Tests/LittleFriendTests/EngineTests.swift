@@ -295,6 +295,78 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(events[3].landing, 1)
     }
 
+    func testADeepLinkWithUTMStartsANewSessionWhileTheAppLives() async throws {
+        let tracker = makeTracker(journey)
+        tracker.foreground(at: clock.now(), coldLaunch: true)
+        tracker.screen("/a", type: nil)
+        elapse(2)
+        tracker.background(at: clock.now())
+        elapse(10 * minute)
+        tracker.handle(url: campaignLink)
+        tracker.foreground(at: clock.now(), coldLaunch: false)
+        tracker.screen("/a", type: nil)
+        elapse(2)
+        tracker.screen("/b", type: nil)
+        let events = await sent(tracker)
+
+        XCTAssertEqual(events.map(\.name), ["$pageview", "$engage", "$pageview", "$engage", "$pageview"])
+        let first = try XCTUnwrap(events[0].session)
+        XCTAssertEqual(events[1].session, first, "the first session's events keep their s")
+        XCTAssertEqual(events[0...1].map(\.seq), [1, 2])
+        let second = try XCTUnwrap(events[2].session)
+        XCTAssertNotEqual(second, first, "a live session ends when a link with UTM opens a visit")
+        XCTAssertEqual(events[2...4].map(\.session), [second, second, second])
+        XCTAssertEqual(events[2...4].map(\.seq), [1, 2, 3])
+        XCTAssertEqual(events[2].landing, 1, "the link's landing is the new session's entry")
+        XCTAssertEqual(events[2].campaign, ["s": "newsletter", "m": "email", "c": "launch"])
+        XCTAssertNil(events[4].landing)
+        XCTAssertEqual(try readSession()["id"] as? String, second)
+    }
+
+    func testADeepLinkWithUTMAtAColdLaunchStartsANewSession() async throws {
+        let first = makeTracker(journey)
+        first.foreground(at: clock.now(), coldLaunch: true)
+        first.screen("/a", type: nil)
+        elapse(2)
+        first.background(at: clock.now())
+        await first.flush()
+        // Killed in the background; relaunched by a link 10 minutes later, inside the session's 30.
+        elapse(10 * minute)
+        let second = makeTracker(journey)
+        second.handle(url: campaignLink)
+        second.foreground(at: clock.now(), coldLaunch: true)
+        second.screen("/a", type: nil)
+        let events = await sent(second)
+
+        XCTAssertEqual(events.map(\.name), ["$pageview", "$engage", "$pageview"])
+        XCTAssertEqual(events[1].session, events[0].session)
+        XCTAssertNotEqual(events[2].session, events[0].session)
+        XCTAssertEqual(events[2].seq, 1)
+        XCTAssertEqual(events[2].landing, 1)
+        XCTAssertEqual(events[2].campaign?["c"], "launch")
+    }
+
+    func testAColdLaunchOrAReturnWithoutALinkKeepsTheLiveSession() async throws {
+        let first = makeTracker(journey)
+        first.foreground(at: clock.now(), coldLaunch: true)
+        first.screen("/a", type: nil)
+        first.background(at: clock.now())
+        elapse(10 * minute)
+        first.handle(url: URL(string: "lfshop://open?ref=x")!)
+        first.foreground(at: clock.now(), coldLaunch: false)
+        first.screen("/b", type: nil)
+        await first.flush()
+        elapse(10 * minute)
+        let second = makeTracker(journey)
+        second.foreground(at: clock.now(), coldLaunch: true)
+        second.screen("/c", type: nil)
+        let events = views(await sent(second))
+
+        XCTAssertEqual(events.map(\.route), ["/a", "/b", "/c"])
+        XCTAssertEqual(Set(events.map(\.session)).count, 1, "a link without UTM tags is no source")
+        XCTAssertEqual(events.map(\.landing), [1, nil, nil])
+    }
+
     func testForegroundTimeKeepsTheSessionAliveUntilTheBackground() async throws {
         let first = makeTracker(journey)
         first.foreground(at: clock.now(), coldLaunch: true)
