@@ -1311,6 +1311,77 @@ final class EngineTests: XCTestCase {
         }
     }
 
+    /// A session file's text with these numbers and a valid id.
+    private func sessionText(start: String, last: String, seq: String, entered: Bool = true) -> String {
+        #"{"id":"abcdefghij234567abcd","start":\#(start),"last":\#(last),"seq":\#(seq),"entered":\#(entered)}"#
+    }
+
+    /// Times and seq outside 0 <= start <= last <= 2^53 - 1 and 0 <= seq <= 1,000,000,000.
+    private var unsafeSessions: [(label: String, text: String)] {
+        let live = "\(clock.ms - 60_000)"
+        return [
+            ("seq Int64.max", sessionText(start: live, last: live, seq: "9223372036854775807")),
+            ("start Int64.min", sessionText(start: "-9223372036854775808", last: live, seq: "1")),
+            ("last Int64.max", sessionText(start: live, last: "9223372036854775807", seq: "1")),
+            ("start after last", sessionText(start: "\(clock.ms - 30_000)", last: live, seq: "1")),
+            ("start -1", sessionText(start: "-1", last: live, seq: "1")),
+            ("last 2^53", sessionText(start: live, last: "9007199254740992", seq: "1")),
+            ("seq 1,000,000,001", sessionText(start: live, last: live, seq: "1000000001")),
+        ]
+    }
+
+    func testASessionFileWithUnsafeNumbersIsDeleted() throws {
+        let log = LogCapture()
+        defer { log.stop() }
+        for (label, text) in unsafeSessions {
+            try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+            try Data(text.utf8).write(to: sessionFile)
+            XCTAssertNil(SessionStore(directory: dir).load(), label)
+            XCTAssertFalse(exists(sessionFile), "\(label): deleted")
+        }
+        XCTAssertEqual(
+            log.lines.filter { $0.contains("session file could not be decoded and was deleted") }.count,
+            unsafeSessions.count, log.lines.joined(separator: "\n")
+        )
+        for text in [
+            sessionText(start: "0", last: "9007199254740991", seq: "0"),
+            sessionText(start: "5", last: "5", seq: "1000000000"),
+        ] {
+            try Data(text.utf8).write(to: sessionFile)
+            XCTAssertNotNil(SessionStore(directory: dir).load(), "the bounds themselves load: \(text)")
+        }
+    }
+
+    func testASessionFileWithUnsafeNumbersStartsAFreshSession() async throws {
+        for (index, unsafe) in unsafeSessions.enumerated() {
+            transport = RecordingTransport()
+            let storage = root.appendingPathComponent("unsafe-\(index)")
+            try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
+            try Data(unsafe.text.utf8).write(to: storage.appendingPathComponent("session.json"))
+            let tracker = makeTracker(storage: storage, journey)
+            launch(tracker)
+            tracker.screen("/", type: nil)
+            tracker.track("signup", props: [:], correlationId: nil)
+            let events = await sent(tracker)
+
+            XCTAssertEqual(events.map(\.seq), [1, 2], unsafe.label)
+            XCTAssertNotNil(events.first?.session, unsafe.label)
+            XCTAssertNotEqual(events.first?.session, "abcdefghij234567abcd", unsafe.label)
+            XCTAssertEqual(events.first?.landing, 1, unsafe.label)
+        }
+    }
+
+    func testASessionFileAtTheSeqBoundContinues() async throws {
+        try writeSession(id: "abcdefghij234567abcd", start: clock.now() - 300, last: clock.now() - 60, seq: 1_000_000_000, entered: true)
+        let tracker = makeTracker(journey)
+        launch(tracker)
+        tracker.screen("/", type: nil)
+        let events = await sent(tracker)
+
+        XCTAssertEqual(events.map(\.session), ["abcdefghij234567abcd"])
+        XCTAssertEqual(events.map(\.seq), [1_000_000_001])
+    }
+
     func testASessionFileWithFieldsFromALaterVersionIsKept() async throws {
         try writeSession(id: "abcdefghij234567abcd", start: clock.now() - 60, last: clock.now() - 60, seq: 4, entered: true)
         var object = try readSession()

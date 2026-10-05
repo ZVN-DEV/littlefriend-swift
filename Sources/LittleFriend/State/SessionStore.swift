@@ -5,6 +5,10 @@ import Security
 struct Session: JSONWritable, Equatable, Sendable {
     static let idleMs: Int64 = 30 * 60 * 1000
     static let maxMs: Int64 = 24 * 60 * 60 * 1000
+    /// The largest integer a JSON number holds exactly: the latest `start` and `last` a file may hold.
+    static let maxTime: Int64 = 9_007_199_254_740_991
+    /// The largest `seq` a file may hold, so the next event's cannot overflow.
+    static let maxSeq = 1_000_000_000
 
     var id: String
     var start: Int64
@@ -16,7 +20,9 @@ struct Session: JSONWritable, Equatable, Sendable {
     var entered: Bool
 
     /// Less than 30 minutes since its last activity and less than 24 hours since it started. A clock
-    /// that moved back past its start ends it, so no duration is ever negative.
+    /// that moved back past its start ends it, so no duration is ever negative. With `start` and
+    /// `last` in 0...maxTime, as a loaded file's are, and a clock in the same range, neither
+    /// subtraction can overflow: `t >= start` is checked first.
     func isLive(at t: Int64) -> Bool {
         t >= start && t - last < Self.idleMs && t - start < Self.maxMs
     }
@@ -32,13 +38,13 @@ struct Session: JSONWritable, Equatable, Sendable {
         json.endObject()
     }
 
-    /// SESSION_ID_RE `^[A-Za-z0-9_-]{16,32}$`, times in order and a sequence number that is not negative.
+    /// SESSION_ID_RE `^[A-Za-z0-9_-]{16,32}$`, 0 <= start <= last <= maxTime and 0 <= seq <= maxSeq.
     var isWellFormed: Bool {
         let u = Array(id.utf16)
         return (16...32).contains(u.count)
             && u.allSatisfy { Text.isAlnum($0) || $0 == 0x5F || $0 == 0x2D }
-            && start <= last
-            && seq >= 0
+            && 0 <= start && start <= last && last <= Self.maxTime
+            && (0...Self.maxSeq).contains(seq)
     }
 }
 
