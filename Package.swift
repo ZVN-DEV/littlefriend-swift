@@ -10,6 +10,9 @@ let package = Package(
     targets: [
         .target(name: "LittleFriend"),
         .testTarget(name: "LittleFriendTests", dependencies: ["LittleFriend"]),
+        // UIKit and SwiftUI on a device: `xcodebuild test -scheme LittleFriend` with an iOS Simulator
+        // destination. Empty on macOS.
+        .testTarget(name: "LittleFriendUIKitTests", dependencies: ["LittleFriend"]),
     ],
     swiftLanguageVersions: [.v5]
 )

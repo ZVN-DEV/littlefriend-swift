@@ -7,7 +7,7 @@ import Foundation
 ///
 /// Storage, all in `storage` (Application Support/littlefriend, excluded from backup): the event
 /// queue, `session.json` in journey mode only, and the empty `opt-out` flag file.
-final class Tracker: @unchecked Sendable {
+final class Tracker: LifecycleTarget, @unchecked Sendable {
     /// The same route again within this long is the same screen.
     static let dedupeMs: Int64 = 1000
     /// The test clock offset may move the clock back at most this far.
@@ -99,20 +99,22 @@ final class Tracker: @unchecked Sendable {
     }
 
     /// A deep link. Its UTM tags are the source of the visit it opens; a link without any is ignored.
-    func handle(url: URL) {
-        serial.async { self.openLink(url) }
+    /// `date` (wall clock) is the time of the call when it was made earlier, before `start`; nil reads
+    /// the clock when the call runs. The same holds for `screen`, `track` and `consent`.
+    func handle(url: URL, at date: Date? = nil) {
+        serial.async { self.openLink(url, at: date.map(self.time)) }
     }
 
-    func screen(_ route: String, type: String?) {
-        serial.async { self.showScreen(route, type: type) }
+    func screen(_ route: String, type: String?, at date: Date? = nil) {
+        serial.async { self.showScreen(route, type: type, at: date.map(self.time)) }
     }
 
-    func track(_ name: String, props: [String: PropValue], correlationId: String?) {
-        serial.async { self.trackEvent(name, props: props, correlationId: correlationId) }
+    func track(_ name: String, props: [String: PropValue], correlationId: String?, at date: Date? = nil) {
+        serial.async { self.trackEvent(name, props: props, correlationId: correlationId, at: date.map(self.time)) }
     }
 
-    func consent(_ consent: LittleFriend.Consent) {
-        serial.async { self.applyConsent(consent) }
+    func consent(_ consent: LittleFriend.Consent, at date: Date? = nil) {
+        serial.async { self.applyConsent(consent, at: date.map(self.time)) }
     }
 
     /// Stops sending at once and writes the opt-out flag before it returns: the one call that touches
@@ -223,8 +225,9 @@ final class Tracker: @unchecked Sendable {
         closeScreen(at: t)
         active = false
         backgroundAt = t
-        // Foreground time is activity: a live session's last activity is the moment the app left.
-        if journey, var live = session, live.isLive(at: t) {
+        // Foreground time is activity: a live session's last activity is the moment the app left. A
+        // process launched in the background has had none.
+        if journey, visit != nil, var live = session, live.isLive(at: t) {
             live.last = t
             session = live
             sessions.save(live)
@@ -234,12 +237,12 @@ final class Tracker: @unchecked Sendable {
         }
     }
 
-    private func openLink(_ url: URL) {
+    private func openLink(_ url: URL, at time: Int64?) {
         guard !optedOut,
               let campaign = CampaignRules.fromURL(url.absoluteString, extended: options.utmExtended)
         else { return }
         if active, visit != nil {
-            let t = now()
+            let t = time ?? now()
             closeScreen(at: t)
             startVisit(at: t, source: campaign)
             landOnShownScreen(at: t)
@@ -248,13 +251,13 @@ final class Tracker: @unchecked Sendable {
         }
     }
 
-    private func showScreen(_ raw: String, type: String?) {
+    private func showScreen(_ raw: String, type: String?, at time: Int64?) {
         guard !optedOut else { return }
         guard let clean = Routes.clean(raw) else {
             Log.warn("a screen was dropped: its route is over 2048 characters, or over 256 once cleaned")
             return
         }
-        let t = now()
+        let t = time ?? now()
         // A clock moved back is not within the second.
         if clean == route, let last = lastScreenAt, t - last >= 0, t - last < Self.dedupeMs { return }
         ensureVisit(at: t)
@@ -294,13 +297,13 @@ final class Tracker: @unchecked Sendable {
         engagement.open(clean, at: t, counting: active)
     }
 
-    private func trackEvent(_ name: String, props: [String: PropValue], correlationId: String?) {
+    private func trackEvent(_ name: String, props: [String: PropValue], correlationId: String?, at time: Int64?) {
         guard !optedOut else { return }
         guard Names.valid(name) else {
             Log.warn("an event was dropped: its name does not match ^[a-z][a-z0-9_.:-]{0,63}$")
             return
         }
-        let t = now()
+        let t = time ?? now()
         ensureVisit(at: t)
         var x: String?
         if journey, let id = correlationId {
@@ -324,12 +327,12 @@ final class Tracker: @unchecked Sendable {
     /// already went out in aggregate mode, that landing was the entry, so no journey screen of this
     /// visit carries `l`. consent(.none) and consent(.required) always drop the session and delete
     /// the file, even when the mode is already aggregate.
-    private func applyConsent(_ consent: LittleFriend.Consent) {
+    private func applyConsent(_ consent: LittleFriend.Consent, at time: Int64?) {
         if consent == .journey && options.mode != .journey {
             Log.warn("consent(.journey) is ignored: the mode option is aggregate")
             return
         }
-        let t = now()
+        let t = time ?? now()
         if consent == .journey {
             guard !journey else { return }
             if !optedOut { closeScreen(at: t) }

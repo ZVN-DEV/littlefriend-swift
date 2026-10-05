@@ -18,8 +18,12 @@ struct VectorFile: Decodable {
     let utm: [Utm]
     let apps: [App]
 
-    /// Walks up from this file until a directory holds the contract's vector file.
+    /// `LF_SDK_VECTORS` when set (`TEST_RUNNER_LF_SDK_VECTORS` through xcodebuild), else walks up
+    /// from this file until a directory holds the contract's vector file.
     static func locate(from file: String = #filePath) -> URL? {
+        if let path = ProcessInfo.processInfo.environment["LF_SDK_VECTORS"], !path.isEmpty {
+            return URL(fileURLWithPath: path)
+        }
         var dir = URL(fileURLWithPath: file).deletingLastPathComponent()
         while dir.pathComponents.count > 1 {
             let candidate = dir.appendingPathComponent("packages/contract/vectors/sdk.json")
@@ -29,13 +33,24 @@ struct VectorFile: Decodable {
         return nil
     }
 
+    /// The Simulator cannot read a repository inside a folder macOS protects, such as the Desktop:
+    /// there the suite runs only when the file is readable. Everywhere else it always runs.
+    static var readableHere: Bool {
+        #if targetEnvironment(simulator)
+        return locate().map { FileManager.default.isReadableFile(atPath: $0.path) } ?? false
+        #else
+        return true
+        #endif
+    }
+
     static func load() throws -> VectorFile {
         let url = try #require(locate(), "packages/contract/vectors/sdk.json not found above \(#filePath)")
         return try JSONDecoder().decode(VectorFile.self, from: Data(contentsOf: url))
     }
 }
 
-@Suite struct VectorsTests {
+@Suite(.enabled(if: VectorFile.readableHere, "the Simulator cannot read the vector file; set TEST_RUNNER_LF_SDK_VECTORS to a readable copy"))
+struct VectorsTests {
     let vectors: VectorFile
 
     init() throws {
