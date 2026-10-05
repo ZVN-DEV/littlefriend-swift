@@ -2,7 +2,9 @@ import Foundation
 
 extension LittleFriend {
     /// Starts the SDK with the project's public site key. Calls made before it, at most 100, are
-    /// replayed in order with the time each was made. A key that does not match
+    /// replayed in order with the time each was made, after the app's state is read: in an app that
+    /// is active they belong to the launch's visit, and in an app that is not, they are calls made
+    /// before the first foreground (see `handle(url:)`). A key that does not match
     /// `^lf_[A-Za-z0-9]{12,40}$`, or an app block the contract refuses, disables the SDK with one log
     /// line. Only the first call counts.
     public static func start(key: String, options: Options = .init()) {
@@ -42,9 +44,12 @@ extension LittleFriend {
     }
 
     /// A deep link or universal link that opened the app. Only its allowlisted UTM tags are read; a
-    /// link with at least one is the source of a visit. A new visit holds its screens and events for
-    /// up to 500 ms, so a link that arrives after the first screen is still that visit's source, and
-    /// a screen the link opens is its landing. A later link starts a new visit.
+    /// link with at least one is the source of a visit. A new visit holds its screens and events
+    /// until 500 ms after the foreground it starts at, so a link that arrives after the first screen
+    /// is still that visit's source, and a screen the link opens is its landing. A later link starts
+    /// a new visit. Before the app's first foreground nothing is held: events go out at once with no
+    /// source, consent applies at once, a screen waits to land at that foreground, and a link is the
+    /// source of the visit it starts.
     public static func handle(url: URL) {
         Facade.shared.perform(.handle(url))
     }
@@ -257,13 +262,15 @@ final class Facade: @unchecked Sendable {
             options: options, key: key, app: app, sdk: sdk, test: options.test ?? env.detectTest(), storage: storage,
             clock: env.clock, transport: env.makeTransport(options.endpoint, sdk), scheduler: env.scheduler
         )
+        // The app's state first: a start while it is active is the cold launch foreground, so the
+        // calls made before start are held in that visit's window with their own times.
+        attachment = env.host.attach(tracker, clock: env.clock, autoScreens: options.autoScreens)
         // Replayed under the lock, so no later call reaches the engine before an earlier one.
         lock.lock()
         for (call, at) in buffer { Self.run(call, on: tracker, at: at) }
         buffer = []
         state = .running(tracker)
         lock.unlock()
-        attachment = env.host.attach(tracker, clock: env.clock, autoScreens: options.autoScreens)
     }
 
     private func disable(_ reason: String) {
