@@ -2,7 +2,7 @@ import Foundation
 
 /// Campaign fields as the wire carries them: utm_source, utm_medium, utm_campaign, and, only when the
 /// project allowlists them, utm_term and utm_content.
-struct Campaign: Equatable, Sendable {
+struct Campaign: Codable, Equatable, Sendable {
     var s: String?
     var m: String?
     var c: String?
