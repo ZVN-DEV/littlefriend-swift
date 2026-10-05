@@ -2,8 +2,8 @@ import Foundation
 
 /// The engine: visits, journey sessions, landing source, engagement, consent and opt-out. Every
 /// method other than `optOut()` dispatches onto one private serial queue and returns at once;
-/// `optOut()` also stops the batcher and writes the opt-out flag before it returns, so nothing is
-/// sent after it, even by a later launch.
+/// `optOut()` also stops the batcher, writes the opt-out flag and deletes the queue and session
+/// files before it returns, so nothing is sent or kept after it, even by a later launch.
 ///
 /// Every new visit opens a landing window: until it ends, the visit's landing is unresolved and its
 /// screen, track and consent calls are held in order, with the time of each. The window ends at a
@@ -38,11 +38,14 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
     private let serial = DispatchQueue(label: "io.littlefriend.tracker")
     private let sessions: SessionStore
 
-    /// Guards `liveBatcher`, `optOutCalls` and the opt-out flag file, which `optOut()` changes
-    /// before it returns.
+    /// Guards `liveBatcher`, `liveQueue`, `optOutCalls`, `filesStopped`, the opt-out flag file and
+    /// the session file, which `optOut()` changes before it returns.
     private let lock = NSLock()
     private var liveBatcher: Batcher?
+    private var liveQueue: EventQueue?
     private var optOutCalls = 0
+    /// True from `optOut()` until the `optIn()` that follows it: the session file is not written.
+    private var filesStopped = false
 
     // Read and written on `serial` only.
     private var queue: EventQueue?
@@ -134,18 +137,26 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         serial.async { self.consentCall(consent, at: date.map(self.time)) }
     }
 
-    /// Stops sending at once and writes the opt-out flag before it returns: the one call that touches
-    /// a file on the caller's thread, so a process killed right after it still starts opted out. The
-    /// queue and the session file are cleared on the serial queue; a launch that finds the flag
-    /// clears them too.
+    /// Stops sending at once, then writes the opt-out flag and deletes `queue.jsonl` and
+    /// `session.json` before it returns: the only call with file operations on the caller's thread,
+    /// three small ones, so a process killed right after it starts opted out with nothing kept. The
+    /// in-memory state is cleared on the serial queue.
     func optOut() {
         lock.lock()
         optOutCalls += 1
+        filesStopped = true
         let batcher = liveBatcher
         liveBatcher = nil
-        writeOptOutFlag()
-        lock.unlock()
+        // Stopped first: once stop() returns no send is in flight and nothing is appended to the queue.
         batcher?.stop()
+        writeOptOutFlag()
+        if let liveQueue {
+            liveQueue.clear()
+        } else {
+            removeFile(storage.appendingPathComponent("queue.jsonl"))
+        }
+        removeFile(sessions.fileURL)
+        lock.unlock()
         serial.async { self.applyOptOut() }
     }
 
@@ -180,7 +191,11 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
     private func setUp() {
         let queue = EventQueue(directory: storage, clock: clock)
         self.queue = queue
-        if FileManager.default.fileExists(atPath: optOutFile.path) {
+        lock.lock()
+        liveQueue = queue
+        let stopped = filesStopped
+        lock.unlock()
+        if stopped || FileManager.default.fileExists(atPath: optOutFile.path) {
             optedOut = true
             queue.clear()
             sessions.delete()
@@ -254,7 +269,7 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         if journey, visit != nil, var live = session, live.isLive(at: t) {
             live.last = t
             session = live
-            sessions.save(live)
+            saveSession(live)
         }
         if let batcher = currentBatcher() {
             Task { await batcher.flushNow() }
@@ -452,7 +467,7 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
             journey = true
             if let held = session, !held.isLive(at: t) { session = nil }
             if let live = session {
-                sessions.save(live)
+                saveSession(live)
                 if var current = visit, current.landingPending {
                     // Before the landing a live session continues as it would have at launch.
                     current.landingPending = !live.entered
@@ -486,6 +501,22 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         pendingSource = nil
     }
 
+    /// Writes the session file unless `optOut()` has run since the last opt-in.
+    private func saveSession(_ session: Session) {
+        lock.lock()
+        defer { lock.unlock() }
+        guard !filesStopped else { return }
+        sessions.save(session)
+    }
+
+    private func removeFile(_ url: URL) {
+        do {
+            if FileManager.default.fileExists(atPath: url.path) { try FileManager.default.removeItem(at: url) }
+        } catch {
+            Log.warn("a file of the SDK could not be deleted at opt-out")
+        }
+    }
+
     /// One atomic create of the empty flag file. Called with `lock` held.
     private func writeOptOutFlag() {
         do {
@@ -506,6 +537,7 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         // A later optOut() supersedes this call; the flag is removed under the lock it was written under.
         let current = optOutCalls == generation
         if current {
+            filesStopped = false
             do {
                 if FileManager.default.fileExists(atPath: optOutFile.path) {
                     try FileManager.default.removeItem(at: optOutFile)
@@ -579,7 +611,7 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
             if !past { current.last = t }
             if screen { current.entered = true }
             session = current
-            sessions.save(current)
+            saveSession(current)
             event.q = current.seq
             event.x = correlationId
             queued = QueuedEvent(event: event, mode: "j", session: current.id)

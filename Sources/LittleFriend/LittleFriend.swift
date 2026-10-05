@@ -29,8 +29,9 @@ extension LittleFriend {
     }
 
     /// Drops what is queued, deletes the session and sends nothing more, across launches, until
-    /// `optIn()`. Once the SDK has started, the choice is on disk when this returns: the one call that
-    /// writes a file on the calling thread. Before `start` it waits with the other early calls.
+    /// `optIn()`. Once the SDK has started, the choice is on disk and the queue and session files are
+    /// deleted when this returns: the one call with file operations on the calling thread, three
+    /// small ones. Before `start` it waits with the other early calls.
     public static func optOut() {
         Facade.shared.perform(.optOut)
     }

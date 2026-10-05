@@ -1466,6 +1466,34 @@ final class EngineTests: XCTestCase {
         XCTAssertFalse(exists(queueFile))
     }
 
+    func testOptOutLeavesNoQueueOrSessionFileWhenItReturns() async throws {
+        let gate = GateClock(clock)
+        let tracker = makeTracker(clock: gate, journey)
+        launch(tracker)
+        tracker.screen("/", type: nil)
+        tracker.track("signup", props: [:], correlationId: nil)
+        tracker.drain()
+        XCTAssertTrue(exists(queueFile))
+        XCTAssertTrue(exists(sessionFile))
+        gate.close()
+        defer { gate.open() }
+        tracker.screen("/a", type: nil)
+        XCTAssertTrue(gate.waitForReader(), "the tracker's queue is held inside screen()")
+
+        tracker.optOut()
+        XCTAssertTrue(exists(optOutFile))
+        XCTAssertFalse(exists(queueFile), "deleted before optOut() returns, on the caller's thread")
+        XCTAssertFalse(exists(sessionFile), "deleted before optOut() returns, on the caller's thread")
+
+        gate.open()
+        tracker.drain()
+        await tracker.flush()
+        scheduler.advance(by: 60)
+        XCTAssertFalse(exists(queueFile), "the held screen writes nothing")
+        XCTAssertFalse(exists(sessionFile))
+        XCTAssertEqual(transport.requestCount, 0)
+    }
+
     func testOptOutBeforeTheFirstSendDropsWhatWasQueued() async throws {
         let tracker = makeTracker()
         launch(tracker)
