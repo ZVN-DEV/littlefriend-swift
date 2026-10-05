@@ -156,13 +156,16 @@ final class EngineTests: XCTestCase {
         tracker.track("new_visit", props: [:], correlationId: nil)
         let events = await sent(tracker).filter { $0.name != "$engage" }
 
-        XCTAssertEqual(events.map(\.route), ["/", "/a", "/a", "/b", "/b"])
+        XCTAssertEqual(events.map(\.name), ["$pageview", "$pageview", "same_visit", "$pageview", "$pageview", "new_visit"])
+        XCTAssertEqual(events.map(\.route), ["/", "/a", "/a", "/a", "/b", "/b"])
+        guard events.count == 6 else { return }
         XCTAssertEqual(events[1].landing, nil, "29 minutes away is the same visit")
         XCTAssertEqual(events[2].campaign?["s"], "newsletter", "and keeps its source")
-        XCTAssertEqual(events[3].landing, 1, "30 minutes away: the next screen is a new landing")
+        XCTAssertEqual(events[3].landing, 1, "30 minutes away: the screen on display is a new landing")
         XCTAssertNil(events[3].campaign, "with no source")
-        XCTAssertEqual(events[4].landing, 1, "a track after a direct landing says it entered from outside")
-        XCTAssertNil(events[4].campaign, "with no source")
+        XCTAssertNil(events[4].landing, "the next screen is not an entry")
+        XCTAssertEqual(events[5].landing, 1, "a track after a direct landing says it entered from outside")
+        XCTAssertNil(events[5].campaign, "with no source")
     }
 
     func testEveryAggregateTrackInADirectVisitCarriesTheLandingFlag() async throws {
@@ -214,8 +217,85 @@ final class EngineTests: XCTestCase {
         tracker.screen("/products/:id", type: "product")
         let events = views(await sent(tracker))
 
-        XCTAssertEqual(events.map(\.landing), [1, 1])
+        XCTAssertEqual(events.map(\.route), ["/", "/", "/products/:id"])
+        guard events.count == 3 else { return }
+        XCTAssertEqual(events.map(\.landing), [1, 1, nil], "the screen on display lands the link's visit")
         XCTAssertEqual(events[1].campaign?["s"], "newsletter")
+        XCTAssertNil(events[2].campaign)
+    }
+
+    func testAReturnAfterThirtyMinutesSendsTheScreenOnDisplayAsTheLanding() async throws {
+        let tracker = makeTracker()
+        tracker.foreground(at: clock.now(), coldLaunch: true)
+        tracker.screen("/article", type: "article")
+        elapse(5)
+        tracker.background(at: clock.now())
+        elapse(31 * minute)
+        tracker.foreground(at: clock.now(), coldLaunch: false)
+        // An app that sends the same screen again right after: the 1 second dedupe ignores it.
+        tracker.screen("/article", type: "article")
+        elapse(3)
+        tracker.track("share", props: [:], correlationId: nil)
+        tracker.background(at: clock.now())
+        let events = await sent(tracker)
+
+        XCTAssertEqual(events.map(\.name), ["$pageview", "$engage", "$pageview", "share", "$engage"])
+        guard events.count == 5 else { return }
+        XCTAssertEqual(events.map(\.route), ["/article", "/article", "/article", "/article", "/article"])
+        XCTAssertEqual(events[2].landing, 1, "the second visit has its own landing")
+        XCTAssertEqual(events[2].props, ["page_type": .string("article")], "with the screen's type")
+        XCTAssertEqual(events[2].time, events[0].time.map { $0 + (5 + 31 * 60) * 1000 })
+        XCTAssertEqual(events[3].landing, 1)
+        XCTAssertNil(events[3].campaign)
+        XCTAssertEqual(events[4].props, ["ms": .number(3000), "sum": .number(3000)], "counted from the return")
+    }
+
+    func testAJourneyReturnAfterThirtyMinutesLandsTheScreenOnDisplayInANewSession() async throws {
+        let tracker = makeTracker(journey)
+        tracker.foreground(at: clock.now(), coldLaunch: true)
+        tracker.screen("/article", type: "article")
+        elapse(5)
+        tracker.background(at: clock.now())
+        elapse(31 * minute)
+        tracker.foreground(at: clock.now(), coldLaunch: false)
+        elapse(3)
+        tracker.track("share", props: [:], correlationId: nil)
+        tracker.background(at: clock.now())
+        let events = await sent(tracker)
+
+        XCTAssertEqual(events.map(\.name), ["$pageview", "$engage", "$pageview", "share", "$engage"])
+        guard events.count == 5 else { return }
+        XCTAssertEqual(events[1].session, events[0].session)
+        XCTAssertNotEqual(events[2].session, events[0].session, "the second visit is a new session")
+        XCTAssertEqual(events[2...4].map(\.session), [events[2].session, events[2].session, events[2].session])
+        XCTAssertEqual(events[2...4].map(\.seq), [1, 2, 3], "with that pageview as q 1")
+        XCTAssertEqual(events[2].landing, 1)
+        XCTAssertEqual(events[2].props, ["page_type": .string("article")])
+        XCTAssertNil(events[3].landing)
+    }
+
+    func testAUTMLinkWhileActiveLandsTheScreenOnDisplay() async throws {
+        let tracker = makeTracker()
+        tracker.foreground(at: clock.now(), coldLaunch: true)
+        tracker.screen("/a", type: nil)
+        elapse(5)
+        tracker.handle(url: campaignLink)
+        elapse(2)
+        tracker.screen("/b", type: nil)
+        tracker.track("signup", props: [:], correlationId: nil)
+        let events = await sent(tracker)
+
+        let source = ["s": "newsletter", "m": "email", "c": "launch"]
+        XCTAssertEqual(events.map(\.name), ["$pageview", "$engage", "$pageview", "$engage", "$pageview", "signup"])
+        guard events.count == 6 else { return }
+        XCTAssertEqual(events.map(\.route), ["/a", "/a", "/a", "/a", "/b", "/b"])
+        XCTAssertEqual(events[1].props, ["ms": .number(5000), "sum": .number(5000)], "closed in its own visit")
+        XCTAssertEqual(events[2].landing, 1, "the screen on display lands the new visit at once")
+        XCTAssertEqual(events[2].campaign, source)
+        XCTAssertEqual(events[3].props, ["ms": .number(2000), "sum": .number(2000)])
+        XCTAssertNil(events[4].landing, "then /b is a plain screen")
+        XCTAssertNil(events[4].campaign)
+        XCTAssertEqual(events[5].campaign, source)
     }
 
     func testExtendedUTMTagsOnlyWithTheOption() async throws {

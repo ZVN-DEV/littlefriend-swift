@@ -40,6 +40,8 @@ final class Tracker: @unchecked Sendable {
     private var engagement = Engagement()
     /// The screen on display: tracks are recorded under its route.
     private var route: String?
+    /// The page type the screen on display was sent with.
+    private var routeType: String?
     private var lastScreenAt: Int64?
     private var active = true
     private var backgroundAt: Int64?
@@ -201,6 +203,7 @@ final class Tracker: @unchecked Sendable {
             let away = backgroundAt.map { t - $0 } ?? 0
             if pendingSource != nil || away >= Visit.backgroundGapMs {
                 startVisit(at: t, source: pendingSource)
+                landOnShownScreen(at: t)
             } else {
                 engagement.resume(at: t)
             }
@@ -232,6 +235,7 @@ final class Tracker: @unchecked Sendable {
             let t = now()
             closeScreen(at: t)
             startVisit(at: t, source: campaign)
+            landOnShownScreen(at: t)
         } else {
             pendingSource = campaign
         }
@@ -247,23 +251,37 @@ final class Tracker: @unchecked Sendable {
         if clean == route, let last = lastScreenAt, t - last < Self.dedupeMs { return }
         ensureVisit(at: t)
         closeScreen(at: t)
-        var props: [String: PropValue]?
+        var pageType: String?
         if let type {
             if Names.validPageType(type) {
-                props = ["page_type": .string(type)]
+                pageType = type
             } else {
                 Log.warn("a screen type was left out: it does not match ^[a-z][a-z0-9_-]{0,31}$")
             }
         }
+        sendView(clean, pageType: pageType, at: t)
+    }
+
+    /// A visit that starts while a screen is on display gets no appear callback for it, so that
+    /// screen's view goes out at once as the visit's landing, with the type it was sent with, and
+    /// its count starts again from `t`.
+    private func landOnShownScreen(at t: Int64) {
+        guard let shown = route else { return }
+        sendView(shown, pageType: routeType, at: t)
+    }
+
+    /// `$pageview` for a cleaned route and a valid page type; the visit's landing when one is due.
+    private func sendView(_ clean: String, pageType: String?, at t: Int64) {
         guard var current = visit else { return }
         let landing = current.landingPending
         current.landingPending = false
         visit = current
         emit(
-            "$pageview", route: clean, at: t, props: props, landing: landing,
+            "$pageview", route: clean, at: t, props: pageType.map { ["page_type": .string($0)] }, landing: landing,
             source: landing ? current.source : nil, screen: true
         )
         route = clean
+        routeType = pageType
         lastScreenAt = t
         engagement.open(clean, at: t, counting: active)
     }
@@ -336,6 +354,7 @@ final class Tracker: @unchecked Sendable {
         visit = nil
         engagement.clear()
         route = nil
+        routeType = nil
         lastScreenAt = nil
         backgroundAt = nil
         pendingSource = nil
