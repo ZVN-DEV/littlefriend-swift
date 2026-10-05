@@ -14,6 +14,10 @@ import Foundation
 /// end the held calls replay in order: the first screen among them is the landing; with none, the
 /// screen on display from before the visit is sent as the landing at the window's end.
 ///
+/// A screen shown while the app is in the background becomes the screen on display and sends
+/// nothing. At the next foreground it is sent, if it differs from the screen sent last in the
+/// visit, at the foreground time, or through the window when that foreground starts a new visit.
+///
 /// Storage, all in `storage` (Application Support/littlefriend, excluded from backup): the event
 /// queue, `session.json` in journey mode only, and the empty `opt-out` flag file.
 final class Tracker: LifecycleTarget, @unchecked Sendable {
@@ -250,6 +254,10 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         if pendingSource != nil || away >= Visit.backgroundGapMs {
             startVisit(at: t, source: pendingSource)
             openWindow(at: t)
+        } else if let shown = route, shown != sentRoute {
+            // A screen shown in the background.
+            closeScreen(at: t)
+            sendView(shown, pageType: routeType, at: t)
         } else {
             engagement.resume(at: t)
         }
@@ -311,8 +319,13 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
             }
         }
         let t = time ?? now()
-        if hold(.screen(clean, type: pageType, at: t)) { return }
-        showScreen(clean, pageType: pageType, at: t)
+        if hold(.screen(clean, type: pageType, at: t, background: !active)) { return }
+        if active {
+            showScreen(clean, pageType: pageType, at: t)
+        } else {
+            route = clean
+            routeType = pageType
+        }
     }
 
     private func showScreen(_ clean: String, pageType: String?, at t: Int64) {
@@ -443,7 +456,13 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         }
         for call in closing.held {
             switch call {
-            case let .screen(clean, type, t): showScreen(clean, pageType: type, at: t)
+            case let .screen(clean, type, t, background):
+                if background {
+                    route = clean
+                    routeType = type
+                } else {
+                    showScreen(clean, pageType: type, at: t)
+                }
             case let .track(name, props, correlationId, t): sendTrack(name, props: props, correlationId: correlationId, at: t)
             case let .consent(consent, t): applyConsent(consent, at: t)
             }
@@ -627,13 +646,14 @@ private struct LandingWindow {
     static let limit = 100
 
     enum Call {
-        case screen(String, type: String?, at: Int64)
+        /// `background`: shown while the app was in the background.
+        case screen(String, type: String?, at: Int64, background: Bool)
         case track(String, props: [String: PropValue]?, correlationId: String?, at: Int64)
         case consent(LittleFriend.Consent, at: Int64)
 
         var time: Int64 {
             switch self {
-            case let .screen(_, _, t), let .track(_, _, _, t), let .consent(_, t): return t
+            case let .screen(_, _, t, _), let .track(_, _, _, t), let .consent(_, t): return t
             }
         }
     }

@@ -1197,6 +1197,85 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(views(events).map(\.time), [clock.ms - 500 + 5 * 60_000, clock.ms - 500])
     }
 
+    func testAScreenShownInTheBackgroundIsSentAtTheNextForeground() async throws {
+        for (shown, type) in [("/b", "product"), ("/a", "other")] {
+            transport = RecordingTransport()
+            let tracker = makeTracker(storage: root.appendingPathComponent(String(shown.dropFirst())))
+            launch(tracker)
+            tracker.screen("/a", type: nil)
+            elapse(4)
+            tracker.background(at: clock.now())
+            elapse(1 * minute)
+            tracker.screen(shown, type: type)
+            tracker.track("refresh", props: [:], correlationId: nil)
+            elapse(4 * minute)
+            tracker.drain()
+            await tracker.flush()
+            XCTAssertEqual(views(transport.sent).map(\.route), ["/a"], "\(shown): nothing is sent for it in the background")
+            XCTAssertEqual(transport.sent.last?.name, "refresh", "\(shown): a track in the background goes out")
+            XCTAssertEqual(transport.sent.last?.route, shown, "\(shown): under the screen on display")
+            tracker.foreground(at: clock.now(), coldLaunch: false)
+            let back = clock.ms
+            elapse(3)
+            tracker.screen("/c", type: nil)
+            let events = await sent(tracker).filter { $0.name != "refresh" }
+
+            if shown == "/b" {
+                XCTAssertEqual(events.map(\.name), ["$pageview", "$engage", "$pageview", "$engage", "$pageview"])
+                XCTAssertEqual(events.map(\.route), ["/a", "/a", "/b", "/b", "/c"])
+                guard events.count == 5 else { continue }
+                XCTAssertEqual(events[2].time, back, "sent at the foreground time")
+                XCTAssertNil(events[2].landing, "the visit goes on")
+                XCTAssertEqual(events[2].props, ["page_type": .string("product")], "with the type it was shown with")
+                XCTAssertEqual(events[3].props, ["ms": .number(3000), "sum": .number(3000)], "counted from the foreground")
+            } else {
+                XCTAssertEqual(events.map(\.name), ["$pageview", "$engage", "$engage", "$pageview"], "the same route sends no view")
+                XCTAssertEqual(events.map(\.route), ["/a", "/a", "/a", "/c"])
+                guard events.count == 4 else { continue }
+                XCTAssertEqual(events[2].props, ["ms": .number(3000), "sum": .number(7000)], "the screen reopens and counts on")
+            }
+        }
+    }
+
+    func testAScreenShownInTheBackgroundLandsANewVisitThroughTheWindow() async throws {
+        let tracker = makeTracker()
+        launch(tracker)
+        tracker.screen("/a", type: nil)
+        tracker.background(at: clock.now())
+        elapse(40 * minute)
+        tracker.screen("/b", type: "product")
+        elapse(1 * minute)
+        tracker.foreground(at: clock.now(), coldLaunch: false)
+        let back = clock.ms
+        passWindow()
+        let events = views(await sent(tracker))
+
+        XCTAssertEqual(events.map(\.route), ["/a", "/b"])
+        XCTAssertEqual(events.last?.landing, 1)
+        XCTAssertEqual(events.last?.time, back + Tracker.landingWindowMs, "the route on display lands at the window's end")
+        XCTAssertEqual(events.last?.props, ["page_type": .string("product")])
+    }
+
+    func testAScreenBeforeTheFirstForegroundOfABackgroundStartLandsAtTheWindowsEnd() async throws {
+        let tracker = makeTracker()
+        tracker.background(at: clock.now())
+        tracker.screen("/", type: nil)
+        elapse(2 * minute)
+        tracker.foreground(at: clock.now(), coldLaunch: true)
+        let foreground = clock.ms
+        passWindow()
+        elapse(2)
+        tracker.screen("/a", type: nil)
+        let events = await sent(tracker)
+
+        XCTAssertEqual(events.map(\.name), ["$pageview", "$engage", "$pageview"])
+        guard events.count == 3 else { return }
+        XCTAssertEqual(events[0].route, "/")
+        XCTAssertEqual(events[0].landing, 1)
+        XCTAssertEqual(events[0].time, foreground + Tracker.landingWindowMs, "not while the app was in the background")
+        XCTAssertEqual(events[1].props, ["ms": .number(2000), "sum": .number(2000)])
+    }
+
     func testScreenTypeIsSentOnlyWhenItIsAValidKey() async throws {
         let tracker = makeTracker()
         launch(tracker)
@@ -1532,11 +1611,19 @@ final class EngineTests: XCTestCase {
         }
         let events = await sent(tracker)
 
-        XCTAssertEqual(events.count, 8 * calls, "every event delivered")
-        XCTAssertEqual(Set(events.compactMap(\.id)).count, 8 * calls, "each once")
+        XCTAssertEqual(events.filter { $0.name == "tap" }.count, 4 * calls, "every track delivered")
+        XCTAssertEqual(Set(events.compactMap(\.id)).count, events.count, "each once")
         XCTAssertEqual(Set(events.map(\.session)).count, 1)
-        XCTAssertEqual(events.map(\.seq), Array(1...(8 * calls)).map { Optional($0) }, "seq strictly increasing")
-        XCTAssertEqual(views(events).count, 4 * calls)
+        XCTAssertEqual(events.map(\.seq), Array(1...events.count).map { Optional($0) }, "seq strictly increasing")
+        // A screen shown in the background is sent at the next foreground only if it is still on display.
+        let routes = views(events).compactMap(\.route)
+        XCTAssertEqual(Set(routes).count, routes.count, "no screen is sent twice")
+        XCTAssertGreaterThan(routes.count, 0)
+        XCTAssertLessThanOrEqual(routes.count, 4 * calls)
+        for thread in 0..<8 {
+            let shown = routes.filter { $0.hasPrefix("/t\(thread)/") }.compactMap { Int($0.split(separator: "s").last ?? "") }
+            XCTAssertEqual(shown, shown.sorted(), "thread \(thread): screens go out in the order they were shown")
+        }
     }
 
     // MARK: Delivery from the engine

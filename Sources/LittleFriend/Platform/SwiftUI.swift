@@ -3,7 +3,8 @@ import SwiftUI
 
 extension View {
     /// Sends `route` as a screen each time this view appears: once on appear, and again after it
-    /// disappears and appears again.
+    /// disappears and appears again. A view that appears while the app is in the background is
+    /// sent when the app returns to the foreground, if it is still the screen on display.
     public func lfScreen(_ route: String, type: String? = nil) -> some View {
         onAppear { LittleFriend.screen(route, type: type) }
     }

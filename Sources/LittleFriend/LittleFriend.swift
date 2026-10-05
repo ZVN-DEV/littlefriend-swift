@@ -11,7 +11,8 @@ extension LittleFriend {
 
     /// Records a screen. `route` is a template such as `/orders/:id`, cleaned on the device; `type`
     /// sets the `page_type` prop when it matches `^[a-z][a-z0-9_-]{0,31}$`. The route already on
-    /// screen again within a second is ignored.
+    /// screen again within a second is ignored. A screen shown while the app is in the background
+    /// sends nothing then; it is sent at the next foreground if it is still on display.
     public static func screen(_ route: String, type: String? = nil) {
         Facade.shared.perform(.screen(route, type: type))
     }
