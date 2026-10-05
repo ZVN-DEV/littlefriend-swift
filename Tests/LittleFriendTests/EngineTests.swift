@@ -107,11 +107,12 @@ final class EngineTests: XCTestCase {
         try JSONSerialization.jsonObject(with: Data(contentsOf: sessionFile)) as? [String: Any] ?? [:]
     }
 
-    private func writeSession(id: String, start: Date, last: Date, seq: Int, entered: Bool) throws {
-        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+    private func writeSession(id: String, start: Date, last: Date, seq: Int, entered: Bool, in storage: URL? = nil) throws {
+        let directory = storage ?? dir!
+        try FileManager.default.createDirectory(at: directory, withIntermediateDirectories: true)
         let ms = { (d: Date) in Int64((d.timeIntervalSince1970 * 1000).rounded(.down)) }
         let object: [String: Any] = ["id": id, "start": ms(start), "last": ms(last), "seq": seq, "entered": entered]
-        try JSONSerialization.data(withJSONObject: object).write(to: sessionFile)
+        try JSONSerialization.data(withJSONObject: object).write(to: directory.appendingPathComponent("session.json"))
     }
 
     private func ownBackupExclusion(_ url: URL) -> Bool {
@@ -555,41 +556,263 @@ final class EngineTests: XCTestCase {
 
     // MARK: Before the first foreground
 
+    /// The launch hold, in seconds.
+    private let hold = TimeInterval(Tracker.launchHoldMs) / 1000
+
+    /// True when queue.jsonl holds an event named `name` once every call so far has run.
+    private func queued(_ name: String) -> Bool {
+        trackers.forEach { $0.drain() }
+        let lines = (try? String(contentsOf: queueFile, encoding: .utf8)) ?? ""
+        return lines.contains("\"\(name)\"")
+    }
+
+    /// A scene-based app is in the background state until its first activation, so a track in
+    /// App.init or didFinishLaunching is made before the launch's foreground.
+    func testAJourneyTrackInALaunchIsHeldIntoTheSessionTheLinksLandingEnters() async throws {
+        let tracker = makeTracker(journey)
+        let launched = clock.ms
+        tracker.background(at: clock.now())
+        elapse(0.01)
+        tracker.track("app_open", props: [:], correlationId: nil)
+        XCTAssertFalse(queued("app_open"), "held while the window waits for its foreground")
+        elapse(0.19)
+        tracker.foreground(at: clock.now(), coldLaunch: true)
+        tracker.drain()
+        await tracker.flush()
+        XCTAssertEqual(transport.requestCount, 0, "and while it runs: flush() does not end a running window")
+        elapse(0.05)
+        tracker.handle(url: campaignLink)
+        elapse(0.05)
+        let landed = clock.ms
+        tracker.screen("/", type: nil)
+        let events = await sent(tracker)
+
+        XCTAssertEqual(events.map(\.name), ["app_open", "$pageview"])
+        guard events.count == 2 else { return }
+        XCTAssertNotNil(events[0].session)
+        XCTAssertEqual(events[1].session, events[0].session, "one launch, one session")
+        XCTAssertEqual(events.map(\.seq), [1, 2])
+        XCTAssertEqual(events.map(\.landing), [nil, 1], "the landing enters the session app_open started")
+        XCTAssertNil(events[0].campaign)
+        XCTAssertEqual(events[0].time, launched + 10, "with the time it was made")
+        XCTAssertEqual(events[1].campaign, ["s": "newsletter", "m": "email", "c": "launch"])
+        XCTAssertEqual(events[1].time, landed)
+        XCTAssertEqual(try readSession()["entered"] as? Bool, true)
+    }
+
+    func testAnAggregateTrackInALaunchCarriesTheLinksSource() async throws {
+        let tracker = makeTracker()
+        tracker.background(at: clock.now())
+        elapse(0.01)
+        tracker.track("app_open", props: [:], correlationId: nil)
+        XCTAssertFalse(queued("app_open"))
+        elapse(0.19)
+        tracker.foreground(at: clock.now(), coldLaunch: true)
+        elapse(0.05)
+        tracker.handle(url: campaignLink)
+        elapse(0.05)
+        tracker.screen("/", type: nil)
+        let events = await sent(tracker)
+
+        XCTAssertEqual(events.map(\.name), ["app_open", "$pageview"])
+        XCTAssertEqual(events.map(\.landing), [1, 1], "app_open goes out after the window, in the link's visit")
+        XCTAssertEqual(events.map(\.campaign), [["s": "newsletter", "m": "email", "c": "launch"], ["s": "newsletter", "m": "email", "c": "launch"]])
+        XCTAssertEqual(events.map(\.mode), ["a", "a"])
+        XCTAssertEqual(events.first.flatMap(\.session), nil)
+    }
+
     /// A process launched in the background by a silent push, a background refresh or a location
-    /// relaunch may never come to the foreground: nothing waits for it.
-    func testATrackBeforeTheFirstForegroundGoesOutAtOnceWithNoLandingOrSource() async throws {
+    /// relaunch may never come to the foreground: the hold ends two seconds after the launch.
+    func testWithNoForegroundTheHoldReleasesItsCallsAfterTwoSecondsWithNoLandingOrSource() async throws {
+        let tracker = makeTracker()
+        tracker.background(at: clock.now())
+        let made = clock.ms
+        tracker.track("push_received", props: [:], correlationId: nil)
+        XCTAssertFalse(queued("push_received"))
+        XCTAssertEqual(scheduler.pendingDelays, [hold], "two seconds from the tracker's creation")
+        scheduler.advance(by: 1.5)
+        XCTAssertFalse(queued("push_received"), "nothing goes out before the hold ends")
+        XCTAssertEqual(transport.requestCount, 0)
+        scheduler.advance(by: 0.5)
+        XCTAssertTrue(queued("push_received"), "released when the scheduler fires at 2,000 ms")
+        let released = await sent(tracker)
+
+        XCTAssertEqual(released.map(\.name), ["push_received"])
+        guard let event = released.first else { return }
+        XCTAssertNil(event.landing, "no visit has started: no l")
+        XCTAssertNil(event.campaign, "and no c")
+        XCTAssertNil(event.event["r"])
+        XCTAssertEqual(event.route, "/", "no screen on display")
+        XCTAssertEqual(event.time, made, "with the time it was made")
+        XCTAssertEqual(event.mode, "a")
+
+        tracker.track("refresh", props: [:], correlationId: nil)
+        XCTAssertTrue(queued("refresh"), "nothing is held after the hold ends")
+        elapse(1)
+        tracker.foreground(at: clock.now(), coldLaunch: true)
+        tracker.screen("/", type: nil)
+        passWindow()
+        let events = await sent(tracker)
+
+        XCTAssertEqual(events.map(\.name), ["push_received", "refresh", "$pageview"], "the visit sends no second track")
+        XCTAssertEqual(events.last?.landing, 1, "the foreground at 3 s starts the visit")
+    }
+
+    func testAFlushDuringTheHoldSendsTheHeldTrackAtOnce() async throws {
         let checking = QueueCheckingTransport(transport, queue: queueFile)
         let tracker = makeTracker(transport: checking)
         tracker.background(at: clock.now())
         let made = clock.ms
         tracker.track("push_received", props: [:], correlationId: nil)
+        elapse(0.1)
         await tracker.flush()
 
         XCTAssertEqual(checking.queuedWhenSent, [true], "queue.jsonl held the event when it was sent")
-        let events = transport.sent
-        XCTAssertEqual(events.map(\.name), ["push_received"], "flush() sends it with no foreground")
-        XCTAssertEqual(transport.requestCount, 1)
-        guard let event = events.first else { return }
-        XCTAssertNil(event.landing, "no visit has started: no l")
-        XCTAssertNil(event.campaign, "and no c")
-        XCTAssertNil(event.event["r"])
-        XCTAssertEqual(event.route, "/", "no screen on display")
+        XCTAssertEqual(transport.sent.map(\.name), ["push_received"], "flush() at +100 ms sends it with no foreground")
+        XCTAssertFalse(scheduler.pendingDelays.contains(hold), "the hold's timer is cancelled")
+        guard let event = transport.sent.first else { return }
+        XCTAssertNil(event.landing)
+        XCTAssertNil(event.campaign)
+        XCTAssertEqual(event.route, "/")
         XCTAssertEqual(event.time, made)
-        XCTAssertEqual(event.mode, "a")
+        tracker.track("refresh", props: [:], correlationId: nil)
+        XCTAssertTrue(queued("refresh"), "a call after the release is not held")
     }
 
-    func testATrackBeforeTheFirstForegroundSurvivesAKillAndIsSentOnce() async throws {
+    func testACallAtTheHoldsEndFindsItReleasedHoweverLateItsTimerRuns() async throws {
+        let tracker = makeTracker()
+        tracker.background(at: clock.now())
+        tracker.track("early", props: [:], correlationId: nil)
+        elapse(hold)
+        tracker.track("late", props: [:], correlationId: nil)
+        XCTAssertTrue(queued("early"), "released before the call at 2,000 ms")
+        XCTAssertTrue(queued("late"), "which is not held")
+        let events = await sent(tracker)
+        XCTAssertEqual(events.map(\.name), ["early", "late"])
+        XCTAssertEqual(events.map(\.landing), [nil, nil])
+    }
+
+    func testAScreenHeldInTheLaunchLandsAtTheForeground() async throws {
+        let tracker = makeTracker()
+        tracker.background(at: clock.now())
+        tracker.screen("/inbox", type: "inbox")
+        elapse(0.5)
+        tracker.foreground(at: clock.now(), coldLaunch: true)
+        let foreground = clock.ms
+        passWindow()
+        let events = await sent(tracker)
+
+        XCTAssertEqual(events.map(\.route), ["/inbox"])
+        XCTAssertEqual(events.first?.landing, 1)
+        XCTAssertEqual(events.first?.time, foreground, "not while the app was in the background")
+        XCTAssertEqual(events.first?.props, ["page_type": .string("inbox")])
+    }
+
+    func testALinkContinuesALiveSessionThatHasNotEntered() async throws {
+        let id = "abcdefghij234567abcd"
+        for entered in [false, true] {
+            transport = RecordingTransport()
+            let storage = root.appendingPathComponent("\(entered)")
+            try writeSession(
+                id: id, start: clock.now() - 300, last: clock.now() - 60, seq: 3, entered: entered, in: storage
+            )
+            let tracker = makeTracker(storage: storage, journey)
+            tracker.background(at: clock.now())
+            tracker.handle(url: campaignLink)
+            elapse(0.2)
+            tracker.foreground(at: clock.now(), coldLaunch: true)
+            tracker.screen("/", type: nil)
+            passWindow()
+            let events = await sent(tracker)
+
+            XCTAssertEqual(events.map(\.name), ["$pageview"], "entered: \(entered)")
+            guard let landing = events.first else { continue }
+            XCTAssertEqual(landing.landing, 1, "entered: \(entered)")
+            XCTAssertEqual(landing.campaign, ["s": "newsletter", "m": "email", "c": "launch"], "entered: \(entered)")
+            if entered {
+                XCTAssertNotEqual(landing.session, id, "a link ends a session that has entered")
+                XCTAssertEqual(landing.seq, 1)
+            } else {
+                XCTAssertEqual(landing.session, id, "a session with only tracks continues, and the landing enters it")
+                XCTAssertEqual(landing.seq, 4)
+            }
+        }
+    }
+
+    func testALinkWhileActiveContinuesASessionOfTracksOnly() async throws {
+        let tracker = makeTracker(journey)
+        launch(tracker)
+        tracker.track("sync", props: [:], correlationId: nil)
+        elapse(10)
+        tracker.handle(url: campaignLink)
+        tracker.screen("/", type: nil)
+        passWindow()
+        let events = await sent(tracker)
+
+        XCTAssertEqual(events.map(\.name), ["sync", "$pageview"])
+        XCTAssertEqual(Set(events.map(\.session)).count, 1, "the app had sent no screen: one session")
+        XCTAssertEqual(events.map(\.seq), [1, 2])
+        XCTAssertEqual(events.last?.landing, 1)
+        XCTAssertEqual(events.last?.campaign?["c"], "launch")
+    }
+
+    func testALinkInAReturnsWindowContinuesASessionOfTracksOnly() async throws {
+        let tracker = makeTracker(journey)
+        launch(tracker)
+        tracker.track("sync", props: [:], correlationId: nil)
+        tracker.background(at: clock.now())
+        elapse(20 * minute)
+        tracker.track("sync", props: [:], correlationId: nil)
+        elapse(11 * minute)
+        tracker.foreground(at: clock.now(), coldLaunch: false)
+        elapse(0.1)
+        tracker.handle(url: campaignLink)
+        tracker.screen("/", type: nil)
+        let events = await sent(tracker)
+
+        XCTAssertEqual(events.map(\.name), ["sync", "sync", "$pageview"])
+        XCTAssertEqual(Set(events.map(\.session)).count, 1, "the session never entered: the landing enters it")
+        XCTAssertEqual(events.map(\.seq), [1, 2, 3])
+        XCTAssertEqual(events.last?.landing, 1)
+        XCTAssertEqual(events.last?.campaign?["c"], "launch")
+    }
+
+    func testOptInWhileInactiveHoldsATrackIntoTheNextVisit() async throws {
+        let tracker = makeTracker()
+        launch(tracker)
+        elapse(10)
+        tracker.background(at: clock.now())
+        tracker.optOut()
+        tracker.optIn()
+        tracker.drain()
+        XCTAssertTrue(scheduler.pendingDelays.contains(hold), "two seconds from the optIn call")
+        elapse(0.1)
+        tracker.track("resumed", props: [:], correlationId: nil)
+        XCTAssertFalse(queued("resumed"), "held while the window waits for its foreground")
+        elapse(0.4)
+        tracker.foreground(at: clock.now(), coldLaunch: false)
+        passWindow()
+        let events = await sent(tracker)
+
+        XCTAssertEqual(events.map(\.name), ["resumed"])
+        XCTAssertEqual(events.first?.landing, 1, "replayed in the visit the foreground started")
+    }
+
+    func testATrackReleasedByTheHoldSurvivesAKillAndIsSentOnce() async throws {
         // The killed process: no send of it is accepted and its retries never run.
         let dying = RecordingTransport()
         dying.reply(.retry(after: nil), .retry(after: nil), .retry(after: nil))
+        let dyingScheduler = ManualScheduler(clock: clock)
         var killed: Tracker? = Tracker(
             options: .init(), key: key, app: app, sdk: "ios-0.1.0", test: false, storage: dir, clock: clock,
-            transport: dying, scheduler: ManualScheduler(clock: clock)
+            transport: dying, scheduler: dyingScheduler
         )
         killed?.background(at: clock.now())
         killed?.track("push_received", props: [:], correlationId: nil)
+        killed?.drain()
+        dyingScheduler.advance(by: hold)
         let queued = await queueHolds("push_received")
-        XCTAssertTrue(queued, "on disk once the call has run, with no drain and no flush")
+        XCTAssertTrue(queued, "on disk once the hold has released it, with no flush")
         killed = nil
 
         elapse(1 * minute)
@@ -642,10 +865,13 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(events[1].props, ["page_type": .string("inbox")])
     }
 
-    func testAJourneyTrackBeforeTheFirstForegroundStartsTheSessionTheLandingEnters() async throws {
+    func testAJourneyTrackTheHoldReleasedStartsTheSessionTheLandingEnters() async throws {
         let tracker = makeTracker(journey)
         tracker.background(at: clock.now())
         tracker.track("push_received", props: [:], correlationId: nil)
+        tracker.drain()
+        XCTAssertFalse(exists(sessionFile), "held: no session yet")
+        scheduler.advance(by: hold)
         tracker.drain()
         let stored = try readSession()
         XCTAssertEqual(stored["seq"] as? Int, 1)
@@ -687,7 +913,7 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(events.map(\.landing), [nil, nil], "a relaunch that continues an entered session")
     }
 
-    func testConsentBeforeTheFirstForegroundAppliesAtOnce() async throws {
+    func testConsentInTheHoldDeletesTheSessionFileAtOnceAndAppliesInItsPlace() async throws {
         try writeSession(id: "abcdefghij234567abcd", start: clock.now() - 300, last: clock.now() - 60, seq: 7, entered: true)
         let tracker = makeTracker(journey)
         tracker.background(at: clock.now())
@@ -708,10 +934,12 @@ final class EngineTests: XCTestCase {
             $0.consent = .required
         }
         waiting.background(at: clock.now())
-        waiting.consent(.journey)
         waiting.track("push_received", props: [:], correlationId: nil)
+        waiting.consent(.journey)
+        waiting.track("push_opened", props: [:], correlationId: nil)
         let all = await sent(waiting)
-        XCTAssertEqual(all.last?.mode, "j", "consent(.journey) applies at once too")
+        XCTAssertEqual(all.suffix(2).map(\.name), ["push_received", "push_opened"])
+        XCTAssertEqual(all.suffix(2).map(\.mode), ["a", "j"], "consent(.journey) applies in its place among the held calls")
         XCTAssertEqual(all.last?.seq, 1)
     }
 
@@ -730,21 +958,22 @@ final class EngineTests: XCTestCase {
             tracker.track("app_open", props: [:], correlationId: nil)
             tracker.drain()
             await tracker.flush()
-            XCTAssertEqual(transport.sent.map(\.name), ["push_received"], "\(mode): the visit's calls wait in its window")
+            XCTAssertEqual(transport.requestCount, 0, "\(mode): every call waits in the visit's window")
             passWindow()
             let events = await sent(tracker)
 
             XCTAssertEqual(events.map(\.name), ["push_received", "$pageview", "app_open"], "\(mode)")
             guard events.count == 3 else { continue }
-            XCTAssertNil(events[0].landing, "\(mode)")
-            XCTAssertNil(events[0].campaign, "\(mode): the link is not the source of a call made before its visit")
             XCTAssertEqual(events[1].landing, 1, "\(mode)")
             XCTAssertEqual(events[1].campaign?["c"], "launch", "\(mode): the screen shown in the window is the link's landing")
             XCTAssertEqual(events[1].time, opened, "\(mode)")
             if mode == .journey {
-                XCTAssertNotEqual(events[1].session, events[0].session, "a link starts a new session")
-                XCTAssertEqual(events[1].seq, 1)
+                XCTAssertNil(events[0].landing)
+                XCTAssertEqual(Set(events.map(\.session)).count, 1, "the held track and the landing share a session")
+                XCTAssertEqual(events.map(\.seq), [1, 2, 3])
             } else {
+                XCTAssertEqual(events.map(\.landing), [1, 1, 1])
+                XCTAssertEqual(events[0].campaign?["c"], "launch", "the held track is in the link's visit")
                 XCTAssertEqual(events[2].campaign?["c"], "launch")
             }
         }

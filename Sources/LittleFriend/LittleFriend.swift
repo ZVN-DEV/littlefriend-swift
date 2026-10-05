@@ -4,9 +4,9 @@ extension LittleFriend {
     /// Starts the SDK with the project's public site key. Calls made before it, at most 100, are
     /// replayed in order with the time each was made, after the app's state is read: in an app that
     /// is active they belong to the launch's visit, and in an app that is not, they are calls made
-    /// before the first foreground (see `handle(url:)`). A key that does not match
-    /// `^lf_[A-Za-z0-9]{12,40}$`, or an app block the contract refuses, disables the SDK with one log
-    /// line. Only the first call counts.
+    /// before the first foreground, held for up to two seconds from `start` (see `handle(url:)`). A
+    /// key that does not match `^lf_[A-Za-z0-9]{12,40}$`, or an app block the contract refuses,
+    /// disables the SDK with one log line. Only the first call counts.
     public static func start(key: String, options: Options = .init()) {
         Facade.shared.start(key: key, options: options, environment: .live())
     }
@@ -47,14 +47,18 @@ extension LittleFriend {
     /// link with at least one is the source of a visit. A new visit holds its screens and events
     /// until 500 ms after the foreground it starts at, so a link that arrives after the first screen
     /// is still that visit's source, and a screen the link opens is its landing. A later link starts
-    /// a new visit. Before the app's first foreground nothing is held: events go out at once with no
-    /// source, consent applies at once, a screen waits to land at that foreground, and a link is the
-    /// source of the visit it starts.
+    /// a new visit. Before the app's first foreground, screens, events and consent are held for up
+    /// to two seconds from `start`: a foreground within that time keeps them for its visit, so an
+    /// event made in the launch carries the launch's source. With no foreground by then, or at
+    /// `flush()`, they go out in order with no source, and from then until the foreground nothing is
+    /// held. A link before the first foreground is the source of the visit that foreground starts.
+    /// In journey mode a link ends the session only when the session's first screen was sent.
     public static func handle(url: URL) {
         Facade.shared.perform(.handle(url))
     }
 
-    /// Sends what is queued now, without waiting for the batch timer.
+    /// Sends what is queued now, without waiting for the batch timer. Calls a launch holds before
+    /// its first foreground go out first.
     public static func flush() {
         Facade.shared.perform(.flush)
     }

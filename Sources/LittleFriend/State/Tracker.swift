@@ -14,12 +14,19 @@ import Foundation
 /// held calls replay in order: the first screen among them is the landing; with none, the screen on
 /// display from before the visit is sent as the landing at the window's end.
 ///
-/// A window waiting for its foreground (the cold visit's, and the one `optIn()` opens in the
-/// background) holds nothing, since a process launched in the background may never come to the
-/// foreground. Meanwhile a track goes out at once with no landing flag and no source, consent
-/// applies at once, a screen only becomes the screen on display, and a link with UTM tags becomes
-/// the source of the window's visit. The screen on display when the window starts running lands at
-/// that foreground's time, ahead of the calls held from then on.
+/// A window waiting for its foreground (the cold visit's, and the one `optIn()` opens while the
+/// app is not active) holds screen, track and consent calls for at most 2 seconds from its opening:
+/// the tracker's creation, or the `optIn()` call. A foreground within that time starts the window
+/// running with those calls kept, so they replay once the source is settled; the screen on display
+/// among them lands at that foreground's time, after the tracks made before it. `flush()` ends the
+/// hold at once, since a process launched in the background may never come to the foreground. At
+/// the end of the hold the calls go out in order with their times, unheld: a track with no landing
+/// flag and no source, under the route on display or `/`; consent applies; a screen only becomes the
+/// screen on display. From then until the foreground nothing is held. A link with UTM tags in a
+/// waiting window becomes the source of the visit that window starts.
+///
+/// In journey mode a visit with a source ends the live session only when that session has entered
+/// (its first screen was sent); a session of tracks alone continues, and the landing enters it.
 ///
 /// A screen shown while the app is in the background becomes the screen on display and sends
 /// nothing. At the next foreground it is sent, if it differs from the screen sent last in the
@@ -34,6 +41,8 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
     static let dedupeMs: Int64 = 1000
     /// How long a new visit waits for its deep link and its landing screen.
     static let landingWindowMs: Int64 = 500
+    /// How long a window waiting for its foreground holds calls, from its opening.
+    static let launchHoldMs: Int64 = 2000
     /// The test clock offset may move the clock back at most this far.
     static let maxClockOffset: TimeInterval = 23 * 60 * 60
 
@@ -48,6 +57,8 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
     private let offset: TimeInterval
     private let transport: Transport
     private let scheduler: Scheduler
+    /// The cold visit's window opens here.
+    private let createdAt: Int64
     private let serial = DispatchQueue(label: "io.littlefriend.tracker")
     private let sessions: SessionStore
 
@@ -101,6 +112,7 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         let offset = Self.clockOffset(options.testClockOffset, test: test)
         self.offset = offset
         self.clock = offset == 0 ? clock : OffsetClock(base: clock, offset: offset)
+        createdAt = self.clock.nowMs()
         journey = options.mode == .journey && options.consent != .required
         sessions = SessionStore(directory: storage)
         serial.async { self.setUp() }
@@ -176,16 +188,21 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
     }
 
     func optIn() {
+        let t = now()
         lock.lock()
         let generation = optOutCalls
         lock.unlock()
-        serial.async { self.applyOptIn(generation: generation) }
+        serial.async { self.applyOptIn(generation: generation, at: t) }
     }
 
-    /// Returns once every earlier call has run and the queue is sent, or a batch has failed its retries.
+    /// Ends the hold of a window waiting for its foreground, then returns once every earlier call
+    /// has run and the queue is sent, or a batch has failed its retries.
     func flush() async {
         await withCheckedContinuation { (done: CheckedContinuation<Void, Never>) in
-            serial.async { done.resume() }
+            serial.async {
+                self.releaseHold()
+                done.resume()
+            }
         }
         await currentBatcher()?.flushNow()
     }
@@ -217,7 +234,7 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
             return
         }
         _ = startBatcher(generation: 0)
-        openWindow(at: nil, startsVisit: true)
+        openWindow(at: nil, opened: createdAt, startsVisit: true)
         if journey {
             session = sessions.load()
         } else {
@@ -256,9 +273,15 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         active = true
         backgroundAt = nil
         guard !optedOut else { return }
+        releaseHoldIfDue(by: t)
         if let open = window {
-            // The cold visit's window, or the one opt-in opened, counts from the first foreground.
+            // The cold visit's window, or the one opt-in opened, counts from the first foreground
+            // and keeps the calls it held.
             if open.since == nil {
+                open.holdTimer?.cancel()
+                window?.holdTimer = nil
+                window?.holdEnd = nil
+                window?.early = open.held.count
                 window?.waited = true
                 runWindow(from: t)
             }
@@ -280,6 +303,7 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
     private func enterBackground(at t: Int64) {
         guard active else { return }
         if !optedOut {
+            releaseHoldIfDue(by: t)
             if let end = window?.end { closeWindow(at: min(t, end)) }
             closeScreen(at: t)
         }
@@ -416,13 +440,23 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
 
     // MARK: Landing window
 
-    /// Opens a window. With `t` its 500 ms run from `t`; without, from the next foreground.
-    /// `startsVisit`: the visit itself is created when the window ends.
-    private func openWindow(at t: Int64?, startsVisit: Bool = false) {
+    /// Opens a window. With `t` its 500 ms run from `t`; without, from the next foreground, holding
+    /// calls until 2 s after `opened`. `startsVisit`: the visit itself is created when the window ends.
+    private func openWindow(at t: Int64?, opened: Int64 = 0, startsVisit: Bool = false) {
         window?.timer?.cancel()
+        window?.holdTimer?.cancel()
         windowsOpened += 1
-        window = LandingWindow(id: windowsOpened, startsVisit: startsVisit)
-        if let t { runWindow(from: t) }
+        let id = windowsOpened
+        window = LandingWindow(id: id, startsVisit: startsVisit)
+        if let t {
+            runWindow(from: t)
+            return
+        }
+        let end = opened + Self.launchHoldMs
+        window?.holdEnd = end
+        window?.holdTimer = scheduler.schedule(after: TimeInterval(max(0, end - now())) / 1000) { [weak self] in
+            self?.holdTimerFired(id)
+        }
     }
 
     private func runWindow(from t: Int64) {
@@ -446,10 +480,49 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         if let end = window?.end, t >= end { closeWindow(at: end) }
     }
 
-    /// Holds a call while a window runs; false when none does. The 101st call is dropped.
+    /// Called on the scheduler's thread. The timer of a hold that already ended does nothing.
+    private func holdTimerFired(_ id: Int) {
+        serial.async {
+            guard self.window?.id == id else { return }
+            self.releaseHold()
+        }
+    }
+
+    /// A call made at or after the hold's end finds it released, however late its timer runs.
+    private func releaseHoldIfDue(by t: Int64) {
+        if let end = window?.holdEnd, t >= end { releaseHold() }
+    }
+
+    /// Ends the hold of a window waiting for its foreground: its calls go out in order, unheld.
+    private func releaseHold() {
+        guard let open = window, open.holdEnd != nil else { return }
+        open.holdTimer?.cancel()
+        window?.holdTimer = nil
+        window?.holdEnd = nil
+        window?.held = []
+        replayUnheld(open.held[...])
+    }
+
+    /// Calls made while a window waited for its foreground, before the visit's landing: a track goes
+    /// out under the screen on display, consent applies, a screen becomes the screen on display.
+    private func replayUnheld(_ calls: ArraySlice<LandingWindow.Call>) {
+        for call in calls {
+            switch call {
+            case let .screen(clean, type, _):
+                route = clean
+                routeType = type
+            case let .track(name, props, correlationId, t): sendTrack(name, props: props, correlationId: correlationId, at: t)
+            case let .consent(consent, t): applyConsent(consent, at: t)
+            }
+        }
+    }
+
+    /// Holds a call while a window runs, or waits within its hold; false otherwise. The 101st call
+    /// is dropped.
     private func hold(_ call: LandingWindow.Call) -> Bool {
         closeWindowIfDue(by: call.time)
-        guard let open = window, open.since != nil else { return false }
+        releaseHoldIfDue(by: call.time)
+        guard let open = window, open.since != nil || open.holdEnd != nil else { return false }
         if open.held.count < LandingWindow.limit {
             window?.held.append(call)
         } else if !open.dropLogged {
@@ -460,9 +533,10 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
     }
 
     /// Ends the window at `end`. `link`, else a link that came while it waited for its foreground,
-    /// is the source of its visit. The screen on display when a waiting window started running was
-    /// on display from that foreground: it lands at that moment. The held calls replay in order;
-    /// then the screen on display, when this visit has not sent it, is the landing at `end`.
+    /// is the source of its visit. The calls held while it waited replay first, then the screen on
+    /// display when it started running lands at that foreground, the moment it was on display from.
+    /// The calls held from then on replay in order; then the screen on display, when this visit has
+    /// not sent it, is the landing at `end`.
     private func closeWindow(at end: Int64, link: Campaign? = nil) {
         guard let closing = window else { return }
         window = nil
@@ -474,11 +548,13 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         } else if let link, var current = visit {
             current.source = link
             visit = current
-            // A visit with a source ends the session; none of this visit's events went out yet.
-            session = nil
+            // A visit with a source ends a session that has entered; none of this visit's events went
+            // out yet.
+            if session?.entered == true { session = nil }
         }
+        replayUnheld(closing.held.prefix(closing.early))
         if closing.waited { landShown(at: since) }
-        for call in closing.held {
+        for call in closing.held.dropFirst(closing.early) {
             switch call {
             case let .screen(clean, type, t): showScreen(clean, pageType: type, at: t)
             case let .track(name, props, correlationId, t): sendTrack(name, props: props, correlationId: correlationId, at: t)
@@ -533,6 +609,7 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         session = nil
         visit = nil
         window?.timer?.cancel()
+        window?.holdTimer?.cancel()
         window = nil
         engagement.clear()
         route = nil
@@ -572,7 +649,7 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         }
     }
 
-    private func applyOptIn(generation: Int) {
+    private func applyOptIn(generation: Int, at t: Int64) {
         guard optedOut else { return }
         lock.lock()
         // A later optOut() supersedes this call; the flag is removed under the lock it was written under.
@@ -591,9 +668,9 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         guard current else { return }
         optedOut = false
         // A new visit, and in journey mode a new session, with a window of its own: counting from
-        // now in the foreground, else from the next foreground.
+        // now in the foreground, else from the next foreground, holding calls for 2 s from `t`.
         _ = startBatcher(generation: generation)
-        openWindow(at: active ? now() : nil, startsVisit: true)
+        openWindow(at: active ? now() : nil, opened: t, startsVisit: true)
     }
 
     /// A cold launch with no deep link continues a live journey session: then its landing is still
@@ -610,17 +687,15 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
     }
 
     /// The next screen is the landing. Nothing counts toward `$engage` until it. A visit with a
-    /// source ends the session, so its landing is the entry of a new one; without a source a live
-    /// session goes on.
+    /// source ends a session that has entered, so its landing is the entry of a new one; a live
+    /// session that has not entered, or any live session without a source, goes on.
     private func startVisit(at t: Int64, source: Campaign?) {
         visit = Visit(source: source, landingPending: true)
         pendingSource = nil
         engagement.clear()
         lastScreenAt = nil
         sentRoute = nil
-        if source != nil {
-            session = nil
-        } else if let current = session, !current.isLive(at: t) {
+        if let current = session, !current.isLive(at: t) || (source != nil && current.entered) {
             session = nil
         }
     }
@@ -681,9 +756,14 @@ private struct LandingWindow {
 
     let id: Int
     let startsVisit: Bool
-    /// The window's foreground: the 500 ms run from it. Nil while it waits for that foreground,
-    /// holding nothing.
+    /// The window's foreground: the 500 ms run from it. Nil while it waits for that foreground.
     var since: Int64?
+    /// While it waits for its foreground: the end of its hold, 2 s from its opening. Nil once the
+    /// hold is released, and once the window runs.
+    var holdEnd: Int64?
+    var holdTimer: ScheduledWork?
+    /// The first `early` held calls were made while it waited for its foreground.
+    var early = 0
     /// It waited for its foreground before it ran.
     var waited = false
     var timer: ScheduledWork?
