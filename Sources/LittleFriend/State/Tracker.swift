@@ -2,7 +2,8 @@ import Foundation
 
 /// The engine: visits, journey sessions, landing source, engagement, consent and opt-out. Every
 /// method other than `optOut()` dispatches onto one private serial queue and returns at once;
-/// `optOut()` also stops the batcher before it returns, so nothing is sent after it.
+/// `optOut()` also stops the batcher and writes the opt-out flag before it returns, so nothing is
+/// sent after it, even by a later launch.
 ///
 /// Storage, all in `storage` (Application Support/littlefriend, excluded from backup): the event
 /// queue, `session.json` in journey mode only, and the empty `opt-out` flag file.
@@ -26,7 +27,8 @@ final class Tracker: @unchecked Sendable {
     private let serial = DispatchQueue(label: "io.littlefriend.tracker")
     private let sessions: SessionStore
 
-    /// Guards `liveBatcher` and `optOutCalls`, which `optOut()` changes before it returns.
+    /// Guards `liveBatcher`, `optOutCalls` and the opt-out flag file, which `optOut()` changes
+    /// before it returns.
     private let lock = NSLock()
     private var liveBatcher: Batcher?
     private var optOutCalls = 0
@@ -113,11 +115,16 @@ final class Tracker: @unchecked Sendable {
         serial.async { self.applyConsent(consent) }
     }
 
+    /// Stops sending at once and writes the opt-out flag before it returns: the one call that touches
+    /// a file on the caller's thread, so a process killed right after it still starts opted out. The
+    /// queue and the session file are cleared on the serial queue; a launch that finds the flag
+    /// clears them too.
     func optOut() {
         lock.lock()
         optOutCalls += 1
         let batcher = liveBatcher
         liveBatcher = nil
+        writeOptOutFlag()
         lock.unlock()
         batcher?.stop()
         serial.async { self.applyOptOut() }
@@ -248,7 +255,8 @@ final class Tracker: @unchecked Sendable {
             return
         }
         let t = now()
-        if clean == route, let last = lastScreenAt, t - last < Self.dedupeMs { return }
+        // A clock moved back is not within the second.
+        if clean == route, let last = lastScreenAt, t - last >= 0, t - last < Self.dedupeMs { return }
         ensureVisit(at: t)
         closeScreen(at: t)
         var pageType: String?
@@ -358,11 +366,13 @@ final class Tracker: @unchecked Sendable {
         lastScreenAt = nil
         backgroundAt = nil
         pendingSource = nil
+    }
+
+    /// One atomic create of the empty flag file. Called with `lock` held.
+    private func writeOptOutFlag() {
         do {
             try FileManager.default.createDirectory(at: storage, withIntermediateDirectories: true)
-            guard FileManager.default.createFile(atPath: optOutFile.path, contents: Data()) else {
-                throw CocoaError(.fileWriteUnknown)
-            }
+            try Data().write(to: optOutFile, options: .atomic)
             var url = optOutFile
             var values = URLResourceValues()
             values.isExcludedFromBackup = true
@@ -375,17 +385,19 @@ final class Tracker: @unchecked Sendable {
     private func applyOptIn(generation: Int) {
         guard optedOut else { return }
         lock.lock()
+        // A later optOut() supersedes this call; the flag is removed under the lock it was written under.
         let current = optOutCalls == generation
-        lock.unlock()
-        // A later optOut() supersedes this call.
-        guard current else { return }
-        do {
-            if FileManager.default.fileExists(atPath: optOutFile.path) {
-                try FileManager.default.removeItem(at: optOutFile)
+        if current {
+            do {
+                if FileManager.default.fileExists(atPath: optOutFile.path) {
+                    try FileManager.default.removeItem(at: optOutFile)
+                }
+            } catch {
+                Log.warn("the opt-out flag could not be removed")
             }
-        } catch {
-            Log.warn("the opt-out flag could not be removed")
         }
+        lock.unlock()
+        guard current else { return }
         optedOut = false
         // The next foreground or screen starts a new visit, and in journey mode a new session.
         _ = startBatcher(generation: generation)

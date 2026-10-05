@@ -179,3 +179,52 @@ final class LogCapture: @unchecked Sendable {
         token = nil
     }
 }
+
+/// A clock whose reads block while its gate is closed, so a test can hold a tracker's queue inside a
+/// call and check what another thread sees meanwhile.
+final class GateClock: Clock, @unchecked Sendable {
+    private let base: Clock
+    private let condition = NSCondition()
+    private var closed = false
+    private var waiting = 0
+
+    init(_ base: Clock) {
+        self.base = base
+    }
+
+    func close() {
+        condition.lock()
+        closed = true
+        condition.unlock()
+    }
+
+    func open() {
+        condition.lock()
+        closed = false
+        condition.broadcast()
+        condition.unlock()
+    }
+
+    func now() -> Date {
+        condition.lock()
+        while closed {
+            waiting += 1
+            condition.broadcast()
+            condition.wait()
+            waiting -= 1
+        }
+        condition.unlock()
+        return base.now()
+    }
+
+    /// True once a read is blocked at the gate, false after `timeout`.
+    func waitForReader(timeout: TimeInterval = 5) -> Bool {
+        let deadline = Date() + timeout
+        condition.lock()
+        defer { condition.unlock() }
+        while waiting == 0 {
+            if !condition.wait(until: deadline) { return waiting > 0 }
+        }
+        return true
+    }
+}

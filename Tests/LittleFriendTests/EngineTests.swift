@@ -48,13 +48,14 @@ final class EngineTests: XCTestCase {
     private func makeTracker(
         test: Bool = false,
         storage: URL? = nil,
+        clock trackerClock: Clock? = nil,
         _ configure: (inout LittleFriend.Options) -> Void = { _ in }
     ) -> Tracker {
         var options = LittleFriend.Options()
         configure(&options)
         let tracker = Tracker(
             options: options, key: key, app: app, sdk: "ios-0.1.0", test: test, storage: storage ?? dir,
-            clock: clock, transport: transport, scheduler: scheduler
+            clock: trackerClock ?? clock, transport: transport, scheduler: scheduler
         )
         trackers.append(tracker)
         return tracker
@@ -880,6 +881,19 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(engages(events).first?.props?["ms"], .number(12000), "the ignored call did not close the screen")
     }
 
+    func testAClockMovedBackDoesNotDedupeTheSameScreen() async throws {
+        let tracker = makeTracker()
+        tracker.screen("/a", type: nil)
+        elapse(-5 * minute)
+        tracker.screen("/a", type: nil)
+        elapse(0.5)
+        tracker.screen("/a", type: nil)
+        let events = await sent(tracker)
+
+        XCTAssertEqual(views(events).map(\.route), ["/a", "/a"], "5 minutes back is not within 1 second")
+        XCTAssertEqual(views(events).map(\.time), [clock.ms - 500 + 5 * 60_000, clock.ms - 500])
+    }
+
     func testScreenTypeIsSentOnlyWhenItIsAValidKey() async throws {
         let tracker = makeTracker()
         tracker.screen("/products/:id", type: "product")
@@ -1104,6 +1118,38 @@ final class EngineTests: XCTestCase {
         XCTAssertEqual(resumed.landing, 1, "a new visit")
         XCTAssertEqual(resumed.seq, 1)
         XCTAssertNotEqual(resumed.session, firstSession, "and a new session")
+    }
+
+    func testTheOptOutFlagIsOnDiskWhenOptOutReturns() async throws {
+        let gate = GateClock(clock)
+        let tracker = makeTracker(clock: gate)
+        tracker.track("before", props: [:], correlationId: nil)
+        tracker.drain()
+        XCTAssertTrue(exists(queueFile))
+        gate.close()
+        defer { gate.open() }
+        tracker.screen("/a", type: nil)
+        XCTAssertTrue(gate.waitForReader(), "the tracker's queue is held inside screen()")
+
+        tracker.optOut()
+        XCTAssertTrue(exists(optOutFile), "written before optOut() returns, on the caller's thread")
+
+        // Killed now: the next launch finds the flag and sends nothing.
+        let relaunched = makeTracker()
+        relaunched.foreground(at: clock.now(), coldLaunch: true)
+        relaunched.screen("/b", type: nil)
+        relaunched.track("after", props: [:], correlationId: nil)
+        await relaunched.flush()
+        scheduler.advance(by: 60)
+        XCTAssertEqual(transport.requestCount, 0)
+        XCTAssertTrue(exists(optOutFile))
+        XCTAssertFalse(exists(queueFile), "the next launch clears what was queued")
+
+        gate.open()
+        tracker.drain()
+        await tracker.flush()
+        XCTAssertEqual(transport.requestCount, 0, "the held call sends nothing either")
+        XCTAssertFalse(exists(queueFile))
     }
 
     func testOptOutBeforeTheFirstSendDropsWhatWasQueued() async throws {
