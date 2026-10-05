@@ -516,7 +516,7 @@ final class DeliveryTests: XCTestCase {
         XCTAssertEqual(stub.requests.count, 0, "nothing reaches the transport")
         XCTAssertEqual(queue.count, 0)
         XCTAssertFalse(FileManager.default.fileExists(atPath: file.path), "the file is gone with its last event")
-        XCTAssertEqual(log.lines.filter { $0.contains("time window") }, ["1 queued event was outside the collector's time window and was dropped before sending"])
+        XCTAssertEqual(log.lines.filter { $0.contains("time window") }, ["1 events outside the collector's time window were dropped before sending"])
     }
 
     func testAnEventMoreThan10MinutesAheadIsDroppedBeforeSending() async throws {
@@ -533,7 +533,10 @@ final class DeliveryTests: XCTestCase {
         XCTAssertEqual(stub.requests.count, 0, "nothing reaches the transport")
         XCTAssertEqual(queue.count, 0)
         XCTAssertFalse(FileManager.default.fileExists(atPath: file.path))
-        XCTAssertEqual(log.lines.filter { $0.contains("time window") }.count, 1, "one line for both")
+        XCTAssertEqual(
+            log.lines.filter { $0.contains("time window") },
+            ["2 events outside the collector's time window were dropped before sending"], "one line for both"
+        )
     }
 
     func testTheWindowIsCheckedBeforeEveryBatchOfACycle() async throws {
@@ -578,7 +581,12 @@ final class DeliveryTests: XCTestCase {
         }
         XCTAssertEqual(URLSessionTransport.result(status: 503, retryAfter: "2"), .retry(after: 2))
         XCTAssertEqual(URLSessionTransport.result(status: 429, retryAfter: " 7 "), .retry(after: 7))
-        for header in ["Wed, 21 Oct 2026 07:28:00 GMT", "-1", "1.5", "", "two"] {
+        XCTAssertEqual(URLSessionTransport.result(status: 429, retryAfter: "\t7 \t"), .retry(after: 7), "spaces and tabs are trimmed")
+        XCTAssertEqual(URLSessionTransport.result(status: 503, retryAfter: "86400"), .retry(after: 3600), "an hour at most")
+        XCTAssertEqual(
+            URLSessionTransport.result(status: 503, retryAfter: String(repeating: "9", count: 400)), .retry(after: 3600)
+        )
+        for header in ["Wed, 21 Oct 2026 07:28:00 GMT", "-1", "1.5", "", "two", "\u{00A0}7", "7\n", "\u{0667}"] {
             XCTAssertEqual(URLSessionTransport.result(status: 503, retryAfter: header), .retry(after: nil), header)
         }
     }
@@ -707,11 +715,58 @@ final class DeliveryTests: XCTestCase {
             try JSONSerialization.jsonObject(with: Data($0.utf8)) as! [String: Any]
         }
         XCTAssertEqual(lines.count, 2)
-        XCTAssertEqual(Set(lines[0].keys), ["event", "mode", "session"])
+        XCTAssertEqual(Set(lines[0].keys), ["event", "mode", "session", "test"])
         XCTAssertEqual(lines[0]["mode"] as? String, "j")
         XCTAssertEqual(lines[0]["session"] as? String, sessionA)
+        XCTAssertEqual(lines[0]["test"] as? Bool, false)
         XCTAssertEqual((lines[0]["event"] as? [String: Any])?["i"] as? String, journey.event.i)
-        XCTAssertEqual(Set(lines[1].keys), ["event", "mode"])
+        XCTAssertEqual(Set(lines[1].keys), ["event", "mode", "test"])
+    }
+
+    func testQueuedEventsKeepTheirTestFlagAcrossARelaunch() async throws {
+        let testing = makeBatcher(makeQueue(), test: true)
+        let early = [event(0), event(1)]
+        early.forEach(testing.enqueue)
+        // Killed before the timer: the next launch runs with test traffic off.
+        testing.stop()
+        let relaunched = makeQueue()
+        XCTAssertEqual(everything(relaunched).map(\.test), [true, true])
+        let batcher = makeBatcher(relaunched, test: false)
+        let later = [event(2), event(3)]
+        later.forEach(batcher.enqueue)
+        await flushAndWait(batcher)
+
+        XCTAssertEqual(stub.requests.map(\.ids), [ids(early), ids(later)], "test and real events never share a batch")
+        XCTAssertEqual(stub.requests.first?.json["d"] as? Int, 1, "leftover test events still go out as test traffic")
+        XCTAssertNil(stub.requests.last?.json["d"])
+    }
+
+    func testTestAndRealEventsInterleavedGoOutInBatchesOfOneKind() async throws {
+        let queue = makeQueue()
+        var events = (0..<4).map { event($0) }
+        events[0].test = true
+        events[1].test = true
+        events[3].test = true
+        events.forEach(queue.append)
+        let batcher = makeBatcher(queue)
+        await flushAndWait(batcher)
+
+        XCTAssertEqual(stub.requests.map(\.ids), [ids(events[0...1]), ids(events[2...2]), ids(events[3...3])])
+        XCTAssertEqual(stub.requests.map { $0.json["d"] as? Int }, [1, nil, 1])
+    }
+
+    func testAQueueLineWithoutTheTestFlagLoadsAsRealTraffic() async throws {
+        let old = event(0)
+        var object = try JSONSerialization.jsonObject(with: JSONEncoder().encode(old)) as! [String: Any]
+        object["test"] = nil
+        try FileManager.default.createDirectory(at: dir, withIntermediateDirectories: true)
+        try (JSONSerialization.data(withJSONObject: object) + Data("\n".utf8)).write(to: file)
+        let queue = makeQueue()
+        XCTAssertEqual(everything(queue).map(\.test), [false])
+        await flushAndWait(makeBatcher(queue, test: true))
+
+        XCTAssertEqual(stub.requests.map(\.ids), [[old.event.i]])
+        XCTAssertNil(stub.requests.first?.json["d"], "the batcher's own flag stamps only what it enqueues")
     }
 
     func testAnEventThatCannotBeQueuedLogsWhy() {
@@ -722,8 +777,8 @@ final class DeliveryTests: XCTestCase {
         queue.append(event(1, props: ["n": .number(.nan)]))
         XCTAssertEqual(queue.count, 0)
         XCTAssertEqual(log.lines, [
-            "an event was not queued: unknown mode, neither aggregate nor journey",
-            "an event was not queued: it could not be encoded as JSON",
+            "an event was not queued: its mode is neither aggregate nor journey",
+            "an event was not queued: it could not be encoded",
         ])
     }
 

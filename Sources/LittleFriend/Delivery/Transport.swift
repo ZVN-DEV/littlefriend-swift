@@ -70,11 +70,15 @@ final class URLSessionTransport: Transport {
         }
     }
 
-    /// Retry-After as a whole number of seconds. The HTTP date form and anything else count as absent.
+    /// Every delay is clamped to 30 seconds later, so a Retry-After past an hour is an hour.
+    static let maxRetryAfter: TimeInterval = 3600
+
+    /// Retry-After as a whole number of seconds, trimmed of spaces and tabs and at most an hour. The
+    /// HTTP date form and anything else count as absent.
     static func seconds(_ header: String) -> TimeInterval? {
-        let value = header.trimmingCharacters(in: .whitespaces)
+        let value = header.trimmingCharacters(in: CharacterSet(charactersIn: " \t"))
         guard !value.isEmpty, value.utf8.allSatisfy({ $0 >= 0x30 && $0 <= 0x39 }) else { return nil }
-        return TimeInterval(value)
+        return min(TimeInterval(value) ?? maxRetryAfter, maxRetryAfter)
     }
 }
 

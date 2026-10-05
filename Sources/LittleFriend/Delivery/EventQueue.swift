@@ -1,12 +1,27 @@
 import Foundation
 
-/// An event waiting in the file queue, with the mode and session its batch must carry.
+/// An event waiting in the file queue, with the mode, session and test flag its batch must carry.
+/// A queue line is {"event", "mode", "session"?, "test"}; a line without "test" is real traffic.
 struct QueuedEvent: Codable, Sendable, Equatable {
     var event: WireEvent
     /// "a" (aggregate) or "j" (journey).
     var mode: String
     /// The journey session id; always nil in aggregate mode.
     var session: String?
+    /// Test traffic: its batch carries `d: 1`, whatever the process sending it was started with.
+    var test = false
+
+    private enum CodingKeys: String, CodingKey { case event, mode, session, test }
+}
+
+extension QueuedEvent {
+    init(from decoder: Decoder) throws {
+        let c = try decoder.container(keyedBy: CodingKeys.self)
+        event = try c.decode(WireEvent.self, forKey: .event)
+        mode = try c.decode(String.self, forKey: .mode)
+        session = try c.decodeIfPresent(String.self, forKey: .session)
+        test = try c.decodeIfPresent(Bool.self, forKey: .test) ?? false
+    }
 }
 
 /// The unsent events, in memory and in `queue.jsonl` inside `directory`, one QueuedEvent per line.
@@ -53,10 +68,10 @@ final class EventQueue: @unchecked Sendable {
             case let .success(made):
                 entry = made
             case .failure(.unknownMode):
-                Log.warn("an event was not queued: unknown mode, neither aggregate nor journey")
+                Log.warn("an event was not queued: its mode is neither aggregate nor journey")
                 return
             case .failure(.unencodable):
-                Log.warn("an event was not queued: it could not be encoded as JSON")
+                Log.warn("an event was not queued: it could not be encoded")
                 return
             }
             entries.append(entry)
@@ -69,20 +84,23 @@ final class EventQueue: @unchecked Sendable {
         }
     }
 
-    /// The oldest events that share the first event's mode and session, in order: at most `maxEvents`,
-    /// and stopping before the event that would push the body past `maxBytes`. `overhead` gives the
-    /// body's size with no events for a mode and session. A batch always holds at least one event.
+    /// The oldest events that share the first event's mode, session and test flag, in order: at most
+    /// `maxEvents`, and stopping before the event that would push the body past `maxBytes`. `overhead`
+    /// gives the body's size with no events for the first event's batch. A batch always holds at
+    /// least one event.
     func peekBatch(
         maxEvents: Int,
         maxBytes: Int,
-        overhead: (_ mode: String, _ session: String?) -> Int = { _, _ in 0 }
+        overhead: (_ first: QueuedEvent) -> Int = { _ in 0 }
     ) -> [QueuedEvent] {
         serial.sync {
             guard let first = entries.first?.queued else { return [] }
-            var total = overhead(first.mode, first.session)
+            var total = overhead(first)
             var batch: [QueuedEvent] = []
             for entry in entries {
-                guard batch.count < maxEvents, entry.queued.mode == first.mode, entry.queued.session == first.session
+                let next = entry.queued
+                guard batch.count < maxEvents, next.mode == first.mode, next.session == first.session,
+                      next.test == first.test
                 else { break }
                 // Events after the first are joined with a comma.
                 let added = entry.size + (batch.isEmpty ? 0 : 1)

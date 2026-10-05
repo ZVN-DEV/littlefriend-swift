@@ -1,6 +1,6 @@
 import Foundation
 
-/// Sends the queue in batches of one mode and session: once 10 events have been enqueued since the
+/// Sends the queue in batches of one mode, session and test flag: once 10 events have been enqueued since the
 /// current or last cycle started, 5 seconds after an enqueue that found no timer and no cycle, and
 /// on `flushNow()`. A flush cycle sends one batch at a time until the queue is empty or a batch
 /// fails its last retry; then its events stay queued for the next trigger. Nothing is dropped for a
@@ -21,6 +21,8 @@ final class Batcher: @unchecked Sendable {
     private let key: String
     private let app: AppInfo
     private let sdk: String
+    /// Stamped on every event this batcher enqueues. A batch's `d` comes from its events, so events
+    /// a test run left in the queue go out as test traffic from any later process.
     private let test: Bool
     private let scheduler: Scheduler
     private let serial = DispatchQueue(label: "io.littlefriend.batcher")
@@ -53,11 +55,14 @@ final class Batcher: @unchecked Sendable {
         self.scheduler = scheduler
     }
 
-    /// Queues the event on disk and starts a flush or the timer. Ignored after `stop()`.
+    /// Queues the event on disk with this batcher's test flag and starts a flush or the timer.
+    /// Ignored after `stop()`.
     func enqueue(_ event: QueuedEvent) {
         serial.sync {
             guard !stopped else { return }
-            queue.append(event)
+            var stamped = event
+            stamped.test = test
+            queue.append(stamped)
             enqueuedSinceCycle += 1
             guard !flushing else { return }
             if enqueuedSinceCycle >= Self.flushCount {
@@ -128,17 +133,15 @@ final class Batcher: @unchecked Sendable {
 
     private func sendNext() {
         let stale = queue.removeOutsideWindow()
-        if stale == 1 {
-            Log.warn("1 queued event was outside the collector's time window and was dropped before sending")
-        } else if stale > 1 {
-            Log.warn("\(stale) queued events were outside the collector's time window and were dropped before sending")
+        if stale > 0 {
+            Log.warn("\(stale) events outside the collector's time window were dropped before sending")
         }
-        let batch = queue.peekBatch(maxEvents: Self.maxEvents, maxBytes: Self.maxBytes) { mode, session in
-            self.envelopeSize(mode: mode, session: session)
+        let batch = queue.peekBatch(maxEvents: Self.maxEvents, maxBytes: Self.maxBytes) { first in
+            self.envelopeSize(for: first)
         }
         guard let first = batch.first else { return finish() }
         let ids = Set(batch.map(\.event.i))
-        let wire = envelope(mode: first.mode, session: first.session, events: batch.map(\.event))
+        let wire = envelope(for: first, events: batch.map(\.event))
         guard let body = try? encoder.encode(wire) else {
             // Values the queue accepted always encode; dropping keeps a cycle from repeating forever.
             Log.warn("a batch of \(batch.count) events could not be encoded and was dropped")
@@ -192,12 +195,16 @@ final class Batcher: @unchecked Sendable {
         for waiter in done { waiter.resume() }
     }
 
-    private func envelope(mode: String, session: String?, events: [WireEvent]) -> WireBatch {
-        let journey = mode == "j"
-        return WireBatch(k: key, m: journey ? "j" : "a", s: journey ? session : nil, sv: sdk, d: test ? 1 : nil, a: app, e: events)
+    /// The batch for events that share `first`'s mode, session and test flag.
+    private func envelope(for first: QueuedEvent, events: [WireEvent]) -> WireBatch {
+        let journey = first.mode == "j"
+        return WireBatch(
+            k: key, m: journey ? "j" : "a", s: journey ? first.session : nil, sv: sdk, d: first.test ? 1 : nil, a: app,
+            e: events
+        )
     }
 
-    private func envelopeSize(mode: String, session: String?) -> Int {
-        (try? encoder.encode(envelope(mode: mode, session: session, events: [])).count) ?? 0
+    private func envelopeSize(for first: QueuedEvent) -> Int {
+        (try? encoder.encode(envelope(for: first, events: [])).count) ?? 0
     }
 }
