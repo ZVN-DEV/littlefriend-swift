@@ -2,12 +2,16 @@ import Foundation
 import os
 
 /// One line per notable SDK decision. A line names counts, statuses and rules, never event content.
+/// Written with os_log and a C format string: Logger's interpolation adds an `__oslogstring` section,
+/// which the linker aligns to a whole page in an app that has none.
 enum Log {
-    private static let logger = Logger(subsystem: "io.littlefriend", category: "sdk")
+    private static let log = OSLog(subsystem: "io.littlefriend", category: "sdk")
     static let observers = LogObservers()
 
+    /// One copy, called from every site.
+    @inline(never)
     static func warn(_ message: String) {
-        logger.warning("\(message, privacy: .public)")
+        os_log("%{public}@", log: log, type: .default, message as NSString)
         observers.notify(message)
     }
 }
