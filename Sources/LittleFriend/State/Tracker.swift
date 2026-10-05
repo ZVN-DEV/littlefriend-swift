@@ -198,7 +198,7 @@ final class Tracker: @unchecked Sendable {
             active = true
             let away = backgroundAt.map { t - $0 } ?? 0
             if pendingSource != nil || away >= Visit.backgroundGapMs {
-                startVisit(at: t, source: pendingSource, coldLaunch: false)
+                startVisit(at: t, source: pendingSource)
             } else {
                 engagement.resume(at: t)
             }
@@ -229,7 +229,7 @@ final class Tracker: @unchecked Sendable {
         if active, visit != nil {
             let t = now()
             closeScreen(at: t)
-            startVisit(at: t, source: campaign, coldLaunch: false)
+            startVisit(at: t, source: campaign)
         } else {
             pendingSource = campaign
         }
@@ -256,7 +256,6 @@ final class Tracker: @unchecked Sendable {
         guard var current = visit else { return }
         let landing = current.landingPending
         current.landingPending = false
-        current.screened = true
         visit = current
         emit(
             "$pageview", route: clean, at: t, props: props, landing: landing,
@@ -291,6 +290,9 @@ final class Tracker: @unchecked Sendable {
         )
     }
 
+    /// The screen open at the switch is closed in the mode it was counted in, and counts on in the
+    /// new one. A switch to journey continues the visit: when its landing already went out in
+    /// aggregate mode, that landing was the entry, so the session's first screen carries no `l`.
     private func applyConsent(_ consent: LittleFriend.Consent) {
         if consent == .journey && options.mode != .journey {
             Log.warn("consent(.journey) is ignored: the mode option is aggregate")
@@ -303,24 +305,22 @@ final class Tracker: @unchecked Sendable {
         if wantJourney {
             journey = true
             session = sessions.load().flatMap { $0.isLive(at: t) ? $0 : nil }
-            guard var current = visit else { return }
-            if current.screened {
-                // The visit's landing went out in aggregate mode: the next screen lands a new visit
-                // in a new session.
-                startVisit(at: t, source: nil, coldLaunch: false)
-                session = nil
-            } else if current.coldLaunch, current.source == nil, let live = session {
-                // Consent before the first screen of a cold launch: a live session continues, as it
-                // would have at launch.
-                current.landingPending = !live.entered
-                visit = current
+            if var current = visit {
+                if current.source != nil {
+                    // A visit with a source is a new session.
+                    session = nil
+                } else if current.landingPending, let live = session {
+                    // Before the landing a live session continues, as it would have at launch.
+                    current.landingPending = !live.entered
+                    visit = current
+                }
             }
         } else {
             journey = false
             session = nil
             sessions.delete()
-            if active { engagement.resume(at: t) }
         }
+        if active { engagement.resume(at: t) }
     }
 
     private func applyOptOut() {
@@ -375,19 +375,19 @@ final class Tracker: @unchecked Sendable {
     /// continues: then its landing is still due only when the session's first screen was never sent.
     private func startColdVisit(at t: Int64) {
         if journey, pendingSource == nil, let live = session, live.isLive(at: t) {
-            visit = Visit(source: nil, landingPending: !live.entered, coldLaunch: true)
+            visit = Visit(source: nil, landingPending: !live.entered)
             engagement.clear()
             lastScreenAt = nil
         } else {
-            startVisit(at: t, source: pendingSource, coldLaunch: pendingSource == nil)
+            startVisit(at: t, source: pendingSource)
         }
     }
 
     /// The next screen is the landing. Nothing counts toward `$engage` until it. A visit with a
     /// source ends the session, so its landing is the entry of a new one; without a source a live
     /// session goes on.
-    private func startVisit(at t: Int64, source: Campaign?, coldLaunch: Bool) {
-        visit = Visit(source: source, landingPending: true, coldLaunch: coldLaunch)
+    private func startVisit(at t: Int64, source: Campaign?) {
+        visit = Visit(source: source, landingPending: true)
         pendingSource = nil
         engagement.clear()
         lastScreenAt = nil

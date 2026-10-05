@@ -310,6 +310,7 @@ final class EngineTests: XCTestCase {
         let events = await sent(tracker)
 
         XCTAssertEqual(events.map(\.name), ["$pageview", "$engage", "$pageview", "$engage", "$pageview"])
+        guard events.count == 5 else { return }
         let first = try XCTUnwrap(events[0].session)
         XCTAssertEqual(events[1].session, first, "the first session's events keep their s")
         XCTAssertEqual(events[0...1].map(\.seq), [1, 2])
@@ -339,6 +340,7 @@ final class EngineTests: XCTestCase {
         let events = await sent(second)
 
         XCTAssertEqual(events.map(\.name), ["$pageview", "$engage", "$pageview"])
+        guard events.count == 3 else { return }
         XCTAssertEqual(events[1].session, events[0].session)
         XCTAssertNotEqual(events[2].session, events[0].session)
         XCTAssertEqual(events[2].seq, 1)
@@ -539,27 +541,86 @@ final class EngineTests: XCTestCase {
             $0.mode = .journey
             $0.consent = .required
         }
+        tracker.handle(url: campaignLink)
         tracker.foreground(at: clock.now(), coldLaunch: true)
-        tracker.screen("/", type: nil)
+        tracker.screen("/a", type: nil)
         tracker.track("browse", props: [:], correlationId: "checkout_7Hq2LmX9pR4t")
         tracker.drain()
         XCTAssertFalse(exists(sessionFile))
         elapse(4)
         tracker.consent(.journey)
-        tracker.screen("/a", type: nil)
+        tracker.screen("/b", type: nil)
         tracker.track("signup", props: [:], correlationId: "checkout_7Hq2LmX9pR4t")
         let events = await sent(tracker)
 
+        let source = ["s": "newsletter", "m": "email", "c": "launch"]
         XCTAssertEqual(events.map(\.name), ["$pageview", "browse", "$engage", "$pageview", "signup"])
+        guard events.count == 5 else { return }
         XCTAssertEqual(events.map(\.mode), ["a", "a", "a", "j", "j"])
+        XCTAssertEqual(events[0].route, "/a")
+        XCTAssertEqual(events[0].landing, 1, "the aggregate landing is the visit's entry")
+        XCTAssertEqual(events[0].campaign, source)
         XCTAssertNil(events[0].session)
+        XCTAssertEqual(events[1].landing, 1)
         XCTAssertNil(events[1].correlationId, "no correlation id before consent")
-        XCTAssertEqual(events[2].route, "/", "the screen open at consent is closed in aggregate mode")
-        XCTAssertEqual(events[3].landing, 1, "the first journey screen is the landing of a new visit")
-        XCTAssertEqual(events[3].seq, 1)
+        XCTAssertEqual(events[2].route, "/a", "the screen open at consent is closed in aggregate mode")
+        XCTAssertEqual(events[3].route, "/b")
+        let session = try XCTUnwrap(events[3].session)
+        XCTAssertEqual(events[3].seq, 1, "a fresh session starts at the next screen")
+        XCTAssertNil(events[3].landing, "it is not an entry: the aggregate landing was")
+        XCTAssertNil(events[3].campaign)
+        XCTAssertEqual(events[4].session, session)
+        XCTAssertEqual(events[4].seq, 2)
+        XCTAssertNil(events[4].landing)
+        XCTAssertNil(events[4].campaign)
         XCTAssertEqual(events[4].correlationId, "checkout_7Hq2LmX9pR4t")
-        XCTAssertEqual(events[4].session, events[3].session)
         XCTAssertTrue(exists(sessionFile))
+    }
+
+    func testConsentBeforeTheLandingMakesTheFirstJourneyScreenTheLanding() async throws {
+        let tracker = makeTracker {
+            $0.mode = .journey
+            $0.consent = .required
+        }
+        tracker.handle(url: campaignLink)
+        tracker.foreground(at: clock.now(), coldLaunch: true)
+        tracker.track("browse", props: [:], correlationId: nil)
+        tracker.consent(.journey)
+        tracker.screen("/a", type: nil)
+        let events = await sent(tracker)
+
+        XCTAssertEqual(events.map(\.name), ["browse", "$pageview"])
+        guard events.count == 2 else { return }
+        XCTAssertEqual(events.map(\.mode), ["a", "j"])
+        XCTAssertEqual(events[1].seq, 1)
+        XCTAssertEqual(events[1].landing, 1, "no landing was sent yet in this visit")
+        XCTAssertEqual(events[1].campaign?["c"], "launch")
+    }
+
+    func testTheScreenOpenAtConsentCountsOnInTheSession() async throws {
+        let tracker = makeTracker {
+            $0.mode = .journey
+            $0.consent = .required
+        }
+        tracker.foreground(at: clock.now(), coldLaunch: true)
+        tracker.screen("/a", type: nil)
+        elapse(4)
+        tracker.consent(.journey)
+        elapse(10)
+        tracker.screen("/b", type: nil)
+        let events = await sent(tracker)
+
+        XCTAssertEqual(events.map(\.name), ["$pageview", "$engage", "$engage", "$pageview"])
+        guard events.count == 4 else { return }
+        XCTAssertEqual(events.map(\.mode), ["a", "a", "j", "j"])
+        XCTAssertEqual(engages(events).map(\.route), ["/a", "/a"])
+        XCTAssertEqual(engages(events).map(\.props), [
+            ["ms": .number(4000), "sum": .number(4000)],
+            ["ms": .number(10000), "sum": .number(14000)],
+        ], "the time after consent is journey activity on the same screen")
+        XCTAssertEqual(events[2...3].map(\.seq), [1, 2])
+        XCTAssertEqual(events[3].session, events[2].session)
+        XCTAssertNil(events[3].landing)
     }
 
     func testConsentBeforeTheFirstScreenContinuesALiveSession() async throws {
