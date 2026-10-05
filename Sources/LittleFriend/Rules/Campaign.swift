@@ -62,7 +62,9 @@ enum CampaignRules {
 /// The parts of the WHATWG URL parser that decide whether `new URL(input)` succeeds and what its
 /// query is. Host names are percent-decoded and checked for the code points the parser refuses, but
 /// not converted with IDNA, and an IPv6 literal is checked for its characters only: deep links reach
-/// the SDK already parsed by the system.
+/// the SDK already parsed by the system. The IPv4 range (1.2.3.256, 09, numbers past 2^32) and IDNA
+/// validity are not checked either, so such a URL yields a campaign where the contract yields null;
+/// no deep link reaches an app with such a host.
 enum WebURL {
     private static let specialSchemes: Set<String> = ["ftp", "file", "http", "https", "ws", "wss"]
 

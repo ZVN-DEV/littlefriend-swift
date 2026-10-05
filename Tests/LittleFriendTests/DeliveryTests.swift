@@ -714,6 +714,19 @@ final class DeliveryTests: XCTestCase {
         XCTAssertEqual(Set(lines[1].keys), ["event", "mode"])
     }
 
+    func testAnEventThatCannotBeQueuedLogsWhy() {
+        let log = LogCapture()
+        defer { log.stop() }
+        let queue = makeQueue()
+        queue.append(QueuedEvent(event: event(0).event, mode: "x", session: nil))
+        queue.append(event(1, props: ["n": .number(.nan)]))
+        XCTAssertEqual(queue.count, 0)
+        XCTAssertEqual(log.lines, [
+            "an event was not queued: unknown mode, neither aggregate nor journey",
+            "an event was not queued: it could not be encoded as JSON",
+        ])
+    }
+
     func testClearEmptiesMemoryAndDisk() {
         let queue = makeQueue()
         (0..<3).forEach { queue.append(event($0)) }

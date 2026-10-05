@@ -48,8 +48,15 @@ final class EventQueue: @unchecked Sendable {
 
     func append(_ event: QueuedEvent) {
         serial.sync {
-            guard let entry = makeEntry(event) else {
-                Log.warn("an event was not queued: its mode is neither aggregate nor journey")
+            let entry: Entry
+            switch makeEntry(event) {
+            case let .success(made):
+                entry = made
+            case .failure(.unknownMode):
+                Log.warn("an event was not queued: unknown mode, neither aggregate nor journey")
+                return
+            case .failure(.unencodable):
+                Log.warn("an event was not queued: it could not be encoded as JSON")
                 return
             }
             entries.append(entry)
@@ -129,18 +136,25 @@ final class EventQueue: @unchecked Sendable {
 
     // MARK: Serial queue only
 
-    /// Nil for a mode other than "a" or "j". An aggregate event never keeps a session.
-    private func makeEntry(_ event: QueuedEvent) -> Entry? {
+    private enum EntryError: Error {
+        /// A mode other than "a" or "j".
+        case unknownMode
+        /// JSONEncoder refused a value, such as a number that is not finite.
+        case unencodable
+    }
+
+    /// An aggregate event never keeps a session.
+    private func makeEntry(_ event: QueuedEvent) -> Result<Entry, EntryError> {
         var queued = event
         switch queued.mode {
         case "a": queued.session = nil
         case "j": break
-        default: return nil
+        default: return .failure(.unknownMode)
         }
         guard let line = try? encoder.encode(queued), let size = try? encoder.encode(queued.event).count else {
-            return nil
+            return .failure(.unencodable)
         }
-        return Entry(queued: queued, line: line, size: size)
+        return .success(Entry(queued: queued, line: line, size: size))
     }
 
     /// Drops lines that do not decode and events the collector would refuse by age; rewrites the
@@ -168,7 +182,7 @@ final class EventQueue: @unchecked Sendable {
         var dirty = !data.isEmpty && data.last != 0x0A
         for line in data.split(separator: 0x0A) {
             guard let decoded = try? decoder.decode(QueuedEvent.self, from: Data(line)),
-                  let entry = makeEntry(decoded),
+                  case let .success(entry) = makeEntry(decoded),
                   Self.inWindow(entry.queued.event.t, now: now)
             else {
                 dirty = true
