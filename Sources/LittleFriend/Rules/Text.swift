@@ -200,15 +200,24 @@ enum Text {
     /// `[^\s@/]`
     private static func isEmailPart(_ u: UInt16) -> Bool { !(isSpace(u) || u == 0x40 || u == 0x2F) }
 
-    /// `/[^\s@/]{1,64}@[^\s@/]{1,253}\.[a-z]{2,24}/i`, unanchored. The local part only needs one
-    /// character before the `@`, and the top level domain only needs two letters, for a match to exist.
+    /// A letter of any script, as `\p{L}` reads one UTF-16 unit outside the surrogates.
+    private static func isLetter(_ u: UInt16) -> Bool {
+        guard let s = Unicode.Scalar(u) else { return false }
+        switch s.properties.generalCategory {
+        case .uppercaseLetter, .lowercaseLetter, .titlecaseLetter, .modifierLetter, .otherLetter: return true
+        default: return false
+        }
+    }
+
+    /// `/[^\s@/]{1,64}@[^\s@/]{1,253}\.\p{L}{2,24}/iu`, unanchored. The local part only needs one
+    /// character before the `@`, and the top level domain only needs two letters of any script.
     private static func hasEmail(_ v: [UInt16]) -> Bool {
         for p in v.indices where v[p] == 0x40 {
             guard p > 0, isEmailPart(v[p - 1]) else { continue }
             var run = 0
             var j = p + 1
             while j < v.count {
-                if run >= 1 && v[j] == 0x2E && j + 2 < v.count && isAlpha(v[j + 1]) && isAlpha(v[j + 2]) {
+                if run >= 1 && v[j] == 0x2E && j + 2 < v.count && isLetter(v[j + 1]) && isLetter(v[j + 2]) {
                     return true
                 }
                 if !isEmailPart(v[j]) || run == 253 { break }
