@@ -57,6 +57,7 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
     private let offset: TimeInterval
     private let transport: Transport
     private let scheduler: Scheduler
+    let replayObservers: ReplayBridgeHub
     /// The cold visit's window opens here.
     private let createdAt: Int64
     private let serial = DispatchQueue(label: "io.littlefriend.tracker")
@@ -70,12 +71,17 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
     private var optOutCalls = 0
     /// True from `optOut()` until the `optIn()` that follows it: the session file is not written.
     private var filesStopped = false
+    /// Orders replay events against the synchronous opt-out notification.
+    private let replayLock = NSLock()
+    private var replayOptedOut = false
+    private var replayOptOutCalls = 0
 
     // Read and written on `serial` only.
     private var queue: EventQueue?
     private var optedOut = false
     private var journey: Bool
     private var session: Session?
+    private var replaySessionID: String?
     /// Nil while the window that starts a visit is open (the cold visit's, or the one `optIn()`
     /// opens), and while opted out.
     private var visit: Visit?
@@ -99,7 +105,7 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
     /// `test` is the resolved test traffic flag: `testClockOffset` applies only when it is true.
     init(
         options: LittleFriend.Options, key: String, app: AppInfo, sdk: String, test: Bool, storage: URL,
-        clock: Clock, transport: Transport, scheduler: Scheduler
+        clock: Clock, transport: Transport, scheduler: Scheduler, replayObservers: ReplayBridgeHub? = nil
     ) {
         self.options = options
         self.key = key
@@ -109,12 +115,18 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         self.storage = storage
         self.transport = transport
         self.scheduler = scheduler
+        self.replayObservers = replayObservers ?? ReplayBridgeHub()
         let offset = Self.clockOffset(options.testClockOffset, test: test)
         self.offset = offset
         self.clock = offset == 0 ? clock : OffsetClock(base: clock, offset: offset)
         createdAt = self.clock.nowMs()
         journey = options.mode == .journey && options.consent != .required
         sessions = SessionStore(directory: storage)
+        let replayClock = self.clock
+        self.replayObservers.attach(ReplayBridgeConfiguration(
+            key: key, app: ReplayBridgeApp(i: app.i, p: app.p, d: app.d, v: app.v),
+            endpoint: options.endpoint, sdkLabel: sdk, test: test, timestamp: { replayClock.nowMs() }
+        ))
         serial.async { self.setUp() }
     }
 
@@ -169,6 +181,11 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
     /// three small ones, so a process killed right after it starts opted out with nothing kept. The
     /// in-memory state is cleared on the serial queue.
     func optOut() {
+        replayLock.lock()
+        replayOptOutCalls += 1
+        replayOptedOut = true
+        replayObservers.publish(.optOut)
+        replayLock.unlock()
         lock.lock()
         optOutCalls += 1
         filesStopped = true
@@ -272,6 +289,7 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         let away = backgroundAt.map { t - $0 } ?? 0
         active = true
         backgroundAt = nil
+        defer { publishReplay(.foreground(replayState(at: t))) }
         guard !optedOut else { return }
         releaseHoldIfDue(by: t)
         if let open = window {
@@ -309,6 +327,7 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         }
         active = false
         backgroundAt = t
+        defer { publishReplay(.background(replayState(at: t))) }
         guard !optedOut else { return }
         // Foreground time is activity: a live session's last activity is the moment the app left. A
         // process launched in the background has had none.
@@ -389,6 +408,7 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         sentRoute = clean
         lastScreenAt = t
         engagement.open(clean, at: t, counting: active)
+        publishReplay(.screen(replayState(at: t)))
     }
 
     private func trackCall(_ name: String, props: [String: PropValue], correlationId: String?, at time: Int64?) {
@@ -600,6 +620,8 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
             sessions.delete()
         }
         if active { engagement.resume(at: t) }
+        publishSessionIfNeeded(at: t)
+        publishReplay(.consent(replayState(at: t)))
     }
 
     private func applyOptOut() {
@@ -607,6 +629,7 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         queue?.clear()
         sessions.delete()
         session = nil
+        replaySessionID = nil
         visit = nil
         window?.timer?.cancel()
         window?.holdTimer?.cancel()
@@ -671,6 +694,12 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
         // now in the foreground, else from the next foreground, holding calls for 2 s from `t`.
         _ = startBatcher(generation: generation)
         openWindow(at: active ? now() : nil, opened: t, startsVisit: true)
+        replayLock.lock()
+        if replayOptOutCalls == generation {
+            replayOptedOut = false
+            replayObservers.publish(.optIn(replayState(at: t)))
+        }
+        replayLock.unlock()
     }
 
     /// A cold launch with no deep link continues a live journey session: then its landing is still
@@ -735,6 +764,27 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
             queued = QueuedEvent(event: event, mode: "a", session: nil)
         }
         currentBatcher()?.enqueue(queued)
+        publishSessionIfNeeded(at: t)
+    }
+
+    private func replayState(at t: Int64) -> ReplayBridgeState {
+        ReplayBridgeState(
+            sessionID: journey ? session?.id : nil, route: route, timestamp: t,
+            foreground: active, journey: journey
+        )
+    }
+
+    private func publishReplay(_ event: ReplayBridgeEvent) {
+        replayLock.lock()
+        if !replayOptedOut && !optedOut { replayObservers.publish(event) }
+        replayLock.unlock()
+    }
+
+    private func publishSessionIfNeeded(at t: Int64) {
+        let current = journey ? session?.id : nil
+        guard current != replaySessionID else { return }
+        replaySessionID = current
+        publishReplay(.session(replayState(at: t)))
     }
 }
 

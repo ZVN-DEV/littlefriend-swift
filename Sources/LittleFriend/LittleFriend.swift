@@ -142,6 +142,7 @@ final class Locked<Value>: @unchecked Sendable {
 /// The one engine behind the static API, and the calls made before `start`.
 final class Facade: @unchecked Sendable {
     static let shared = Facade()
+    let replayObservers = ReplayBridgeHub()
     /// Calls kept before `start`; later ones are dropped.
     static let bufferLimit = 100
 
@@ -264,7 +265,8 @@ final class Facade: @unchecked Sendable {
         let sdk = WrapperBridge.resolvedLabel()
         let tracker = Tracker(
             options: options, key: key, app: app, sdk: sdk, test: options.test ?? env.detectTest(), storage: storage,
-            clock: env.clock, transport: env.makeTransport(options.endpoint, sdk), scheduler: env.scheduler
+            clock: env.clock, transport: env.makeTransport(options.endpoint, sdk), scheduler: env.scheduler,
+            replayObservers: replayObservers
         )
         // The app's state first: a start while it is active is the cold launch foreground, so the
         // calls made before start are held in that visit's window with their own times.
