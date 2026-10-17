@@ -34,12 +34,17 @@ enum Routes {
     private static func segment(_ seg: String) -> String {
         // A path segment holding a value (a fragment pasted as a route, a sign-in token) is never a route.
         if seg.unicodeScalars.contains("=") { return ":redacted" }
-        if seg.isEmpty || seg.unicodeScalars.first == ":" { return seg }
-        let units = Array(seg.utf16)
-        if Text.isNumeric(units) || Text.isUUID(units) || Text.isHexish(units) || Text.isTokenish(units) {
+        if seg.isEmpty { return seg }
+        // A `:` segment is a template parameter of any name, unless it holds a value.
+        let param = seg.unicodeScalars.first == ":"
+        let body = param ? String(seg.unicodeScalars.dropFirst()) : seg
+        let units = Array(body.utf16)
+        if Text.isNumeric(units) || Text.isUUID(units) || Text.isHexish(units) || Text.isDottedToken(units)
+            || (!param && Text.isTokenish(units))
+        {
             return ":id"
         }
-        if Text.looksLikePII(seg) { return ":redacted" }
+        if Text.looksLikePII(body) { return ":redacted" }
         return seg
     }
 }

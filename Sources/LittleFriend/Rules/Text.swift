@@ -165,6 +165,20 @@ enum Text {
             && u.contains(where: isAlpha)
     }
 
+    /// `^(?:eyJ[A-Za-z0-9_-]{4,}(?:\.[A-Za-z0-9_-]*){1,4}|(?=.*\d)(?=.*[A-Z])[A-Za-z0-9_-]{16,}(?:\.[A-Za-z0-9_-]{16,}){2})$`
+    static func isDottedToken(_ u: [UInt16]) -> Bool {
+        let parts = u.split(separator: 0x2E, omittingEmptySubsequences: false)
+        guard parts.count >= 2, parts.allSatisfy({ $0.allSatisfy { isAlnum($0) || $0 == 0x5F || $0 == 0x2D } }) else {
+            return false
+        }
+        // A JWT: its header always encodes to `eyJ`.
+        if parts.count <= 5, let first = parts.first, first.count >= 7, first.starts(with: [0x65, 0x79, 0x4A]) {
+            return true
+        }
+        return parts.count == 3 && parts.allSatisfy { $0.count >= 16 }
+            && u.contains(where: isDigit) && u.contains { $0 >= 0x41 && $0 <= 0x5A }
+    }
+
     // MARK: Personal data (sanitize.ts looksLikePII)
 
     /// True when a string looks like it could identify a person: email, phone or card-like digits.
