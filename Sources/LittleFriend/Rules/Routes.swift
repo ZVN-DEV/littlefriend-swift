@@ -35,10 +35,11 @@ enum Routes {
         // A path segment holding a value (a fragment pasted as a route, a sign-in token) is never a route.
         if seg.unicodeScalars.contains("=") { return ":redacted" }
         if seg.isEmpty { return seg }
-        // A `:` segment is a template parameter of any name, unless it holds a value.
+        // A `:` segment named by an identifier is a template parameter; any other is checked for a value.
         let param = seg.unicodeScalars.first == ":"
         let body = param ? String(seg.unicodeScalars.dropFirst()) : seg
         let units = Array(body.utf16)
+        if param && Text.isParamName(units) { return seg }
         if Text.isNumeric(units) || Text.isUUID(units) || Text.isHexish(units) || Text.isDottedToken(units)
             || (!param && Text.isTokenish(units))
         {

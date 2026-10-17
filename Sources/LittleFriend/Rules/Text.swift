@@ -165,6 +165,12 @@ enum Text {
             && u.contains(where: isAlpha)
     }
 
+    /// `^[A-Za-z_][A-Za-z0-9_]*$`, a template parameter's name.
+    static func isParamName(_ u: [UInt16]) -> Bool {
+        guard let first = u.first, isAlpha(first) || first == 0x5F else { return false }
+        return u.allSatisfy { isAlnum($0) || $0 == 0x5F }
+    }
+
     /// `^(?:eyJ[A-Za-z0-9_-]{4,}(?:\.[A-Za-z0-9_-]*){1,4}|(?=.*\d)(?=.*[A-Z])[A-Za-z0-9_-]{16,}(?:\.[A-Za-z0-9_-]{16,}){2})$`
     static func isDottedToken(_ u: [UInt16]) -> Bool {
         let parts = u.split(separator: 0x2E, omittingEmptySubsequences: false)
