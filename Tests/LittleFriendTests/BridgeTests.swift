@@ -97,6 +97,51 @@ final class BridgeTests: XCTestCase {
         XCTAssertEqual(screens.first?.sessionID, transport.sent.first?.session)
     }
 
+    func testCatchUpCannotArriveAfterAConcurrentConsentWithdrawal() {
+        // Seed cached journey state, then subscribe with an observer that blocks during its
+        // first catch-up event while another thread publishes a consent withdrawal. The
+        // withdrawal (nil session) must be the last state the observer sees.
+        let journey = ReplayBridgeState(
+            sessionID: "abcdefghijklmnopqrst", route: "/home", timestamp: 1, foreground: true, journey: true
+        )
+        hub.publish(.screen(journey))
+        let log = EventLog()
+        let entered = DispatchSemaphore(value: 0)
+        let release = DispatchSemaphore(value: 0)
+        let blocked = BlockOnce()
+        let addDone = DispatchSemaphore(value: 0)
+        let subBox = SubscriptionBox()
+        DispatchQueue.global().async {
+            let sub = self.hub.add { event in
+                log.add(event)
+                if blocked.claim() {
+                    entered.signal()
+                    _ = release.wait(timeout: .now() + 10)
+                }
+            }
+            subBox.set(sub)
+            addDone.signal()
+        }
+        XCTAssertEqual(entered.wait(timeout: .now() + 10), .success)
+        let withdrawn = ReplayBridgeState(
+            sessionID: nil, route: "/home", timestamp: 2, foreground: true, journey: false
+        )
+        DispatchQueue.global().async { self.hub.publish(.consent(withdrawn)) }
+        Thread.sleep(forTimeInterval: 0.3)
+        release.signal()
+        XCTAssertEqual(addDone.wait(timeout: .now() + 10), .success)
+        Thread.sleep(forTimeInterval: 0.3)
+        let states = log.all.compactMap { event -> ReplayBridgeState? in
+            switch event {
+            case let .screen(state), let .session(state), let .consent(state): return state
+            default: return nil
+            }
+        }
+        XCTAssertNil(states.last?.sessionID, "stale catch-up arrived after withdrawal: \(log.kinds)")
+        XCTAssertEqual(states.last?.journey, false)
+        subscription = subBox.get()
+    }
+
     func testConsentWithdrawalPublishesANilSessionAndAggregateContinues() async {
         let log = events!
         subscription = hub.add { log.add($0) }
@@ -160,6 +205,24 @@ final class BridgeTests: XCTestCase {
         XCTAssertNil(screens.first?.sessionID)
         XCTAssertEqual(screens.first?.journey, false)
     }
+}
+
+private final class BlockOnce: @unchecked Sendable {
+    private let lock = NSLock()
+    private var used = false
+    func claim() -> Bool {
+        lock.lock(); defer { lock.unlock() }
+        if used { return false }
+        used = true
+        return true
+    }
+}
+
+private final class SubscriptionBox: @unchecked Sendable {
+    private let lock = NSLock()
+    private var sub: ReplayBridgeSubscription?
+    func set(_ value: ReplayBridgeSubscription) { lock.lock(); sub = value; lock.unlock() }
+    func get() -> ReplayBridgeSubscription? { lock.lock(); defer { lock.unlock() }; return sub }
 }
 
 private final class EventLog: @unchecked Sendable {

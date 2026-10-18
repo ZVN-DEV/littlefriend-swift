@@ -770,7 +770,9 @@ final class Tracker: LifecycleTarget, @unchecked Sendable {
     private func replayState(at t: Int64) -> ReplayBridgeState {
         ReplayBridgeState(
             sessionID: journey ? session?.id : nil, route: route, timestamp: t,
-            foreground: active, journey: journey
+            foreground: active, journey: journey,
+            sessionStartedAt: journey ? session?.start : nil,
+            sessionLastActivityAt: journey ? session?.last : nil
         )
     }
 
