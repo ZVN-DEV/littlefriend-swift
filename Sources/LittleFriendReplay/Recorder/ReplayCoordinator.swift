@@ -15,6 +15,22 @@ private struct ReplayPage {
 final class ReplayCoordinator: @unchecked Sendable {
     static let flushDelay: TimeInterval = 10
     static let flushBytes = 128 * 1024
+    /// The core journey session expiry rules, mirrored so recording stops at the same boundary.
+    static let sessionIdleMs: Int64 = 30 * 60 * 1000
+    static let sessionMaxMs: Int64 = 24 * 60 * 60 * 1000
+    /// Replay settings are revalidated at most this often, on appearance, foreground and
+    /// session change, so turning replay off or adding an exclusion takes effect at runtime.
+    static let configTTLMs: Int64 = 60_000
+
+    static func sessionLive(start: Int64?, last: Int64?, at t: Int64) -> Bool {
+        guard let start, let last else { return false }
+        return t >= start && t - last < sessionIdleMs && t - start < sessionMaxMs
+    }
+
+    static func configStale(loadedAt: Int64?, at t: Int64) -> Bool {
+        guard let loadedAt else { return true }
+        return t < loadedAt || t - loadedAt >= configTTLMs
+    }
 
     private let capture: ReplayCaptureDriver
     private let transportFactory: @Sendable (ReplayBridgeConfiguration) -> ReplayTransport
@@ -23,6 +39,7 @@ final class ReplayCoordinator: @unchecked Sendable {
     private var transport: ReplayTransport?
     private var sender: ReplayChunkSender?
     private var config: ReplayClientConfig?
+    private var configLoadedAt: Int64?
     private var configTask: Task<Void, Never>?
     private var flushTask: Task<Void, Never>?
     private var generation = 0
@@ -60,16 +77,24 @@ final class ReplayCoordinator: @unchecked Sendable {
             latestState = state
             foreground = state.foreground
             reconcileSession(state)
+            refreshConfigIfStale()
             pendingAppearance = state
             prepareAppearance()
         case let .session(state):
             latestState = state
             reconcileSession(state)
+            refreshConfigIfStale()
         case let .foreground(state):
             latestState = state
             foreground = true
             sender?.poke()
-            if page == nil, state.sessionID != nil, state.route != nil {
+            refreshConfigIfStale()
+            if page?.ready != true, state.sessionID != nil, state.route != nil {
+                // No page, or a page whose initial snapshot never landed: retry the appearance.
+                if page != nil {
+                    page = nil
+                    hitTargets = []
+                }
                 pendingAppearance = state
             }
             prepareAppearance()
@@ -94,6 +119,7 @@ final class ReplayCoordinator: @unchecked Sendable {
             foreground = state.foreground
             currentSessionID = nil
             config = nil
+            configLoadedAt = nil
             // A fresh sender: a terminal response or a replay-off config stops the old one for
             // good, and a new opt-in must be able to record again if the config allows it.
             disabled = false
@@ -125,6 +151,18 @@ final class ReplayCoordinator: @unchecked Sendable {
               hitTargets.contains(where: { $0.nodeID == tap.nodeID && $0.contains(x: tap.x, y: tap.y) })
         else { return }
         let timestamp = core?.timestamp() ?? Int64(Date().timeIntervalSince1970 * 1000)
+        guard sessionLiveForPage(current, at: timestamp) else {
+            // The core session expired (30 minute idle or 24 hour cap) under a screen left
+            // foregrounded: drop the page and record nothing under the stale session.
+            pendingAppearance = nil
+            endPage(discard: true)
+            currentSessionID = nil
+            return
+        }
+        if Self.configStale(loadedAt: configLoadedAt, at: timestamp) {
+            loadConfig()
+            return
+        }
         for event in ReplayEvent.taps(at: timestamp, x: tap.x, y: tap.y, id: tap.nodeID) {
             do {
                 current.bytes += try ReplayWire.encoded(event).count + 1
@@ -157,6 +195,7 @@ final class ReplayCoordinator: @unchecked Sendable {
         latestState = nil
         currentSessionID = nil
         config = nil
+        configLoadedAt = nil
         lock.unlock()
     }
 
@@ -169,6 +208,7 @@ final class ReplayCoordinator: @unchecked Sendable {
         latestState = nil
         currentSessionID = nil
         config = nil
+        configLoadedAt = nil
         lock.unlock()
     }
 
@@ -203,16 +243,36 @@ final class ReplayCoordinator: @unchecked Sendable {
             return
         }
         guard eligible(state) else { return }
-        if config == nil {
+        if config == nil || Self.configStale(loadedAt: configLoadedAt, at: core?.timestamp() ?? state.timestamp) {
+            // Defer the appearance until fresh settings land: a newly excluded or switched-off
+            // screen must not capture under stale settings.
             loadConfig()
             return
         }
         beginIfSampled(state)
     }
 
+    private func refreshConfigIfStale() {
+        guard config != nil, let core,
+              Self.configStale(loadedAt: configLoadedAt, at: core.timestamp())
+        else { return }
+        loadConfig()
+    }
+
+    private func sessionLiveForPage(_ current: ReplayPage, at t: Int64) -> Bool {
+        guard let state = latestState, state.sessionID == current.sessionID else { return false }
+        return Self.sessionLive(
+            start: state.sessionStartedAt, last: state.sessionLastActivityAt, at: t
+        )
+    }
+
     private func eligible(_ state: ReplayBridgeState) -> Bool {
         guard state.foreground, state.journey, let session = state.sessionID, let route = state.route else { return false }
         if session != currentSessionID { return false }
+        guard Self.sessionLive(
+            start: state.sessionStartedAt, last: state.sessionLastActivityAt,
+            at: core?.timestamp() ?? state.timestamp
+        ) else { return false }
         if let config {
             guard config.on, !ReplayPolicy.excluded(route: route, patterns: config.exclude) else { return false }
         }
@@ -250,9 +310,16 @@ final class ReplayCoordinator: @unchecked Sendable {
         configTask = nil
         guard let loaded else { return }
         config = loaded
+        configLoadedAt = core?.timestamp()
         guard loaded.on else {
-            disable()
+            // Switched off (initially or by a refresh): end the page, but stay able to
+            // revalidate later, since settings may turn replay back on.
+            pendingAppearance = nil
+            endPage(discard: false)
             return
+        }
+        if let current = page, ReplayPolicy.excluded(route: current.route, patterns: loaded.exclude) {
+            endPage(discard: false)
         }
         prepareAppearance()
     }
@@ -286,12 +353,23 @@ final class ReplayCoordinator: @unchecked Sendable {
         lock.lock()
         defer { lock.unlock() }
         guard token == generation, !permanentlyStopped, !optedOut, !disabled,
-              let core, var current = page, current.id == pageID, !current.ready,
-              let snapshot, snapshot.events.count == 2,
+              let core, var current = page, current.id == pageID, !current.ready
+        else { return }
+        guard let snapshot, snapshot.events.count == 2,
               snapshot.events[0].isFullSnapshot == false, snapshot.events[1].isFullSnapshot,
               let state = latestState, eligible(state), state.sessionID == current.sessionID,
               state.route == current.route
-        else { return }
+        else {
+            // A failed or invalidated initial snapshot must not strand the page unready:
+            // clear it and requeue the appearance so foreground retries capture.
+            page = nil
+            hitTargets = []
+            if let state = latestState, state.sessionID == current.sessionID,
+               state.route == current.route {
+                pendingAppearance = state
+            }
+            return
+        }
         do {
             let chunk = try ReplayChunkFactory.make(
                 core: core, sessionID: current.sessionID, pageID: current.id, sequence: 0,

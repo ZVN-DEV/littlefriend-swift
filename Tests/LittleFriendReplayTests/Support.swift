@@ -4,24 +4,36 @@ import Foundation
 
 let testTimestamp: Int64 = 1_700_000_000_000
 
-func makeCore(test: Bool = false) -> ReplayBridgeConfiguration {
+final class MutableClock: @unchecked Sendable {
+    private let lock = NSLock()
+    private var value: Int64
+    init(_ value: Int64 = testTimestamp) { self.value = value }
+    func now() -> Int64 { lock.lock(); defer { lock.unlock() }; return value }
+    func advance(by ms: Int64) { lock.lock(); value += ms; lock.unlock() }
+}
+
+func makeCore(test: Bool = false, clock: MutableClock? = nil) -> ReplayBridgeConfiguration {
     ReplayBridgeConfiguration(
         key: "lf_abcdefghijkl0123456789",
         app: ReplayBridgeApp(i: "io.littlefriend.lab.shop", p: "ios", d: "mobile", v: "1.2.3"),
         endpoint: URL(string: "https://in.example.test")!,
         sdkLabel: "ios-0.1.0",
         test: test,
-        timestamp: { testTimestamp }
+        timestamp: { clock?.now() ?? testTimestamp }
     )
 }
 
 func makeState(
     session: String? = "abcdefghijklmnopqrst", route: String? = "/home",
-    foreground: Bool = true, journey: Bool = true
+    foreground: Bool = true, journey: Bool = true,
+    timestamp: Int64 = testTimestamp,
+    sessionStartedAt: Int64? = testTimestamp, sessionLastActivityAt: Int64? = testTimestamp
 ) -> ReplayBridgeState {
     ReplayBridgeState(
-        sessionID: session, route: route, timestamp: testTimestamp,
-        foreground: foreground, journey: journey
+        sessionID: session, route: route, timestamp: timestamp,
+        foreground: foreground, journey: journey,
+        sessionStartedAt: session == nil ? nil : sessionStartedAt,
+        sessionLastActivityAt: session == nil ? nil : sessionLastActivityAt
     )
 }
 
@@ -34,6 +46,7 @@ final class FakeCaptureDriver: ReplayCaptureDriver, @unchecked Sendable {
     private(set) var captures = 0
     private(set) var cancels = 0
     private(set) var detaches = 0
+    var failNextCaptures = 0
 
     func capture(
         route: String, timestamp: Int64,
@@ -41,7 +54,13 @@ final class FakeCaptureDriver: ReplayCaptureDriver, @unchecked Sendable {
     ) {
         lock.lock()
         captures += 1
+        let fail = failNextCaptures > 0
+        if fail { failNextCaptures -= 1 }
         lock.unlock()
+        if fail {
+            completion(nil)
+            return
+        }
         let box = ReplayNode(
             type: 2, id: Self.target.nodeID, tagName: "div",
             attributes: ["class": "lf-n lf-b", "style": "left:10px;top:20px;width:100px;height:50px"],
@@ -92,9 +111,13 @@ final class FakeReplayTransport: ReplayTransport, @unchecked Sendable {
     var fallback: ReplayTransportResult = .accepted
     private var bodiesStorage: [Data] = []
 
+    private var loads = 0
+    var loadCount: Int { lock.lock(); defer { lock.unlock() }; return loads }
+
     func loadConfig(key: String, appID: String) async -> ReplayClientConfig? {
         lock.lock()
         defer { lock.unlock() }
+        loads += 1
         return config
     }
 

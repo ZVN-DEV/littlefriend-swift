@@ -7,14 +7,16 @@ final class CoordinatorTests: XCTestCase {
     private var capture: FakeCaptureDriver!
     private var transport: FakeReplayTransport!
     private var coordinator: ReplayCoordinator!
+    private var clock: MutableClock!
 
     override func setUp() {
         super.setUp()
         capture = FakeCaptureDriver()
         transport = FakeReplayTransport()
+        clock = MutableClock()
         let transport = self.transport!
         coordinator = ReplayCoordinator(capture: capture) { _ in transport }
-        coordinator.handle(.configuration(makeCore()))
+        coordinator.handle(.configuration(makeCore(clock: clock)))
     }
 
     override func tearDown() {
@@ -165,6 +167,81 @@ final class CoordinatorTests: XCTestCase {
         try? await Task.sleep(nanoseconds: 300_000_000)
         XCTAssertEqual(capture.captureCount, 0)
         XCTAssertNil(coordinator.activePageID)
+    }
+
+    func testTapAfterIdleExpiryRecordsNothingAndDropsThePage() async {
+        let shown = await showScreen()
+        XCTAssertTrue(shown)
+        // No analytics activity for 31 minutes: the core session is expired (30 minute idle).
+        clock.advance(by: 31 * 60 * 1000)
+        coordinator.recordTapAt(x: 30, y: 30)
+        coordinator.flush()
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(transport.bodies.count, 1)
+        XCTAssertNil(coordinator.activePageID)
+    }
+
+    func testTapAfterMaxAgeExpiryRecordsNothing() async {
+        // Session started 24h ago, last activity just now: the 24 hour cap still expires it.
+        coordinator.handle(.session(makeState(sessionStartedAt: testTimestamp - 24 * 60 * 60 * 1000)))
+        coordinator.handle(.screen(makeState(sessionStartedAt: testTimestamp - 24 * 60 * 60 * 1000)))
+        try? await Task.sleep(nanoseconds: 200_000_000)
+        XCTAssertEqual(capture.captureCount, 0)
+        XCTAssertNil(coordinator.activePageID)
+    }
+
+    func testStaleConfigRefreshesOnForegroundAndNewExclusionStopsThePage() async {
+        let shown = await showScreen()
+        XCTAssertTrue(shown)
+        XCTAssertEqual(transport.loadCount, 1)
+        // Within the TTL, foreground does not refetch.
+        clock.advance(by: 30_000)
+        coordinator.handle(.foreground(makeState(timestamp: clock.now(), sessionLastActivityAt: clock.now())))
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(transport.loadCount, 1)
+        XCTAssertNotNil(coordinator.activePageID)
+        // Past the TTL, foreground revalidates; the route is now excluded, so the page ends.
+        transport.config = ReplayClientConfig(on: true, rate: 100, exclude: ["/home"])
+        clock.advance(by: 60_000)
+        coordinator.handle(.foreground(makeState(timestamp: clock.now(), sessionLastActivityAt: clock.now())))
+        let transport = self.transport!
+        let refreshed = await eventually { transport.loadCount >= 2 }
+        XCTAssertTrue(refreshed)
+        let ended = await eventually { self.coordinator.activePageID == nil }
+        XCTAssertTrue(ended)
+        coordinator.recordTapAt(x: 30, y: 30)
+        coordinator.flush()
+        try? await Task.sleep(nanoseconds: 150_000_000)
+        XCTAssertEqual(transport.bodies.count, 1)
+    }
+
+    func testFailedInitialSnapshotRetriesOnForeground() async {
+        capture.failNextCaptures = 1
+        coordinator.handle(.session(makeState()))
+        coordinator.handle(.screen(makeState()))
+        try? await Task.sleep(nanoseconds: 300_000_000)
+        XCTAssertEqual(transport.bodies.count, 0)
+        XCTAssertNil(coordinator.activePageID)
+        coordinator.handle(.foreground(makeState()))
+        let transport = self.transport!
+        let sent = await eventually { transport.bodies.count >= 1 }
+        XCTAssertTrue(sent)
+        XCTAssertEqual(capture.captureCount, 2)
+        XCTAssertNotNil(coordinator.activePageID)
+    }
+
+    func testCoordinatorRefIsWeakSoStaleTapCallbacksDieWithTheirOwner() {
+        let ref = ReplayCoordinatorRef()
+        do {
+            let transport = FakeReplayTransport()
+            let owner = ReplayCoordinator(capture: FakeCaptureDriver()) { _ in transport }
+            ref.bind(owner)
+            XCTAssertTrue(ref.isBound)
+        }
+        // The owning coordinator is gone: its driver's callback resolves nothing instead of
+        // reaching whatever coordinator a later start() installs.
+        XCTAssertFalse(ref.isBound)
+        ref.recordTapAt(x: 1, y: 1)
     }
 
     func testStopDetachesCaptureAndClearsEverything() async {

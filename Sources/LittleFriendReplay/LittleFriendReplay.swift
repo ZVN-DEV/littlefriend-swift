@@ -31,11 +31,37 @@ public enum LittleFriendReplay {
     }
 }
 
+/// A lock-guarded weak reference to one coordinator instance. A driver's tap callback is bound
+/// to the coordinator that owns that driver, never to whatever runtime replaces it, and every
+/// access is synchronized so callbacks and start/stop on different threads cannot race.
+final class ReplayCoordinatorRef: @unchecked Sendable {
+    private let lock = NSLock()
+    private weak var value: ReplayCoordinator?
+
+    func bind(_ coordinator: ReplayCoordinator) {
+        lock.lock()
+        value = coordinator
+        lock.unlock()
+    }
+
+    func recordTapAt(x: Double, y: Double) {
+        lock.lock()
+        let coordinator = value
+        lock.unlock()
+        coordinator?.recordTapAt(x: x, y: y)
+    }
+
+    var isBound: Bool {
+        lock.lock()
+        defer { lock.unlock() }
+        return value != nil
+    }
+}
+
 private final class ReplayRuntimeBox: @unchecked Sendable {
     private let lock = NSLock()
     private var coordinator: ReplayCoordinator?
     private var subscription: ReplayBridgeSubscription?
-    private weak var liveCoordinator: ReplayCoordinator?
 
     func start() {
         lock.lock()
@@ -43,14 +69,15 @@ private final class ReplayRuntimeBox: @unchecked Sendable {
             lock.unlock()
             return
         }
-        let driver = UIKitCaptureDriver { [weak self] x, y in
-            self?.liveCoordinator?.recordTapAt(x: x, y: y)
+        let owner = ReplayCoordinatorRef()
+        let driver = UIKitCaptureDriver { x, y in
+            owner.recordTapAt(x: x, y: y)
         }
         let coordinator = ReplayCoordinator(capture: driver) { configuration in
             ReplayURLSessionTransport(configuration: configuration)
         }
+        owner.bind(coordinator)
         self.coordinator = coordinator
-        liveCoordinator = coordinator
         subscription = ReplayBridge.observe { coordinator.handle($0) }
         lock.unlock()
     }
@@ -60,7 +87,6 @@ private final class ReplayRuntimeBox: @unchecked Sendable {
         let coordinator = self.coordinator
         let subscription = self.subscription
         self.coordinator = nil
-        liveCoordinator = nil
         self.subscription = nil
         lock.unlock()
         subscription?.cancel()
