@@ -38,22 +38,25 @@ enum ReplaySerializer {
         var hitTargets: [ReplayHitTarget] = []
 
         mutating func children(of view: UIView, depth: Int) -> [ReplayNode] {
-            view.subviews.compactMap { node(for: $0, depth: depth) }
+            let origin = view.convert(view.bounds, to: root).origin
+            return view.subviews.compactMap { node(for: $0, depth: depth, parentOrigin: origin) }
         }
 
-        mutating func node(for view: UIView, depth: Int) -> ReplayNode? {
+        mutating func node(for view: UIView, depth: Int, parentOrigin: CGPoint) -> ReplayNode? {
             guard !view.isHidden, view.alpha > 0, emitted < ReplaySerializer.maxNodes else { return nil }
             let frame = view.convert(view.bounds, to: root)
             guard frame.width > 0, frame.height > 0, frame.intersects(root.bounds) else { return nil }
             emitted += 1
             let id = nextID
             nextID += 1
+            // Hit targets stay in window coordinates; node styles are parent-relative because
+            // playback positions each absolutely positioned node inside its positioned parent.
             hitTargets.append(ReplayHitTarget(
                 nodeID: id, x: Double(frame.minX), y: Double(frame.minY),
                 width: Double(frame.width), height: Double(frame.height)
             ))
-            let style = "left:\(ReplayWireNumber.string(Double(frame.minX)))px;"
-                + "top:\(ReplayWireNumber.string(Double(frame.minY)))px;"
+            let style = "left:\(ReplayWireNumber.string(Double(frame.minX - parentOrigin.x)))px;"
+                + "top:\(ReplayWireNumber.string(Double(frame.minY - parentOrigin.y)))px;"
                 + "width:\(ReplayWireNumber.string(Double(frame.width)))px;"
                 + "height:\(ReplayWireNumber.string(Double(frame.height)))px"
 

@@ -82,6 +82,36 @@ final class SerializerTests: XCTestCase {
         })
     }
 
+    func testNestedNodesAreParentRelativeSoPlaybackMatchesHitTargets() throws {
+        let root = UIView(frame: CGRect(x: 0, y: 0, width: 390, height: 844))
+        let parent = UIView(frame: CGRect(x: 0, y: 100, width: 300, height: 200))
+        let child = UILabel(frame: CGRect(x: 10, y: 20, width: 100, height: 20))
+        child.text = "Nested"
+        parent.addSubview(child)
+        root.addSubview(parent)
+
+        let snapshot = ReplaySerializer.snapshot(root: root, route: "/nested", timestamp: testTimestamp)
+        guard case let .fullSnapshot(_, data) = snapshot.events[1] else {
+            return XCTFail("second event is not a full snapshot")
+        }
+        func findMain(_ node: ReplayNode) -> ReplayNode? {
+            if node.tagName == "main" { return node }
+            for kid in node.childNodes ?? [] {
+                if let found = findMain(kid) { return found }
+            }
+            return nil
+        }
+        let main = findMain(data.node)
+        let parentNode = main?.childNodes?.first
+        XCTAssertEqual(parentNode?.attributes?["style"], "left:0px;top:100px;width:300px;height:200px")
+        let childNode = parentNode?.childNodes?.first
+        // Parent-relative: playback renders the child at 100 + 20 = 120, matching its hit target.
+        XCTAssertEqual(childNode?.attributes?["style"], "left:10px;top:20px;width:100px;height:20px")
+        let target = snapshot.hitTargets.first { $0.nodeID == childNode?.id }
+        XCTAssertEqual(target?.y, 120)
+        XCTAssertEqual(target?.x, 10)
+    }
+
     func testSwiftUIHostingViewNeverLeaksText() throws {
         let host = UIHostingController(rootView: VStack {
             Text("SwiftUISecret")

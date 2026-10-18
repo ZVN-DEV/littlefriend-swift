@@ -68,12 +68,19 @@ final class UIKitCaptureDriver: NSObject, ReplayCaptureDriver, UIGestureRecogniz
     @MainActor
     private static func activeWindow() -> UIWindow? {
         let scenes = UIApplication.shared.connectedScenes.compactMap { $0 as? UIWindowScene }
-        let ordered = scenes.filter { $0.activationState == .foregroundActive }
-            + scenes.filter { $0.activationState != .foregroundActive }
-        for scene in ordered {
-            if let key = scene.windows.first(where: { $0.isKeyWindow && !$0.isHidden }) { return key }
+        let candidates = scenes.map { scene in
+            ReplaySceneCandidate(
+                isForegroundActive: scene.activationState == .foregroundActive,
+                windows: scene.windows.map {
+                    ReplayWindowCandidate(
+                        isKey: $0.isKeyWindow, isHidden: $0.isHidden,
+                        hasRootViewController: $0.rootViewController != nil
+                    )
+                }
+            )
         }
-        return ordered.lazy.flatMap(\.windows).first { !$0.isHidden && $0.rootViewController != nil }
+        guard let pick = ReplayWindowSelectionPolicy.select(scenes: candidates) else { return nil }
+        return scenes[pick.sceneIndex].windows[pick.windowIndex]
     }
 
     @MainActor
