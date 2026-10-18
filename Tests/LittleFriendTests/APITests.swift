@@ -251,10 +251,10 @@ final class APITests: XCTestCase {
 
         let batch = try XCTUnwrap(transport.batches.first)
         #if os(macOS)
-        let (platform, device, label) = ("macos", "desktop", "macos-0.1.0")
+        let (platform, device, label) = ("macos", "desktop", "macos-0.2.0")
         #else
         let idiom = await MainActor.run { UIDevice.current.userInterfaceIdiom }
-        let (platform, device, label) = ("ios", idiom == .pad ? "tablet" : "mobile", "ios-0.1.0")
+        let (platform, device, label) = ("ios", idiom == .pad ? "tablet" : "mobile", "ios-0.2.0")
         #endif
         XCTAssertEqual(batch["a"]?.object, [
             "i": .string(bundleID), "p": .string(platform), "d": .string(device), "v": .string(version),
@@ -286,9 +286,9 @@ final class APITests: XCTestCase {
         defer { log.stop() }
         let platformDefault = SDKLabel.platformDefault
         #if os(macOS)
-        XCTAssertEqual(platformDefault, "macos-0.1.0")
+        XCTAssertEqual(platformDefault, "macos-0.2.0")
         #else
-        XCTAssertEqual(platformDefault, "ios-0.1.0")
+        XCTAssertEqual(platformDefault, "ios-0.2.0")
         #endif
         XCTAssertEqual(WrapperBridge.sdkLabel, platformDefault)
         WrapperBridge.sdkLabel = "flutter-0.3.1"

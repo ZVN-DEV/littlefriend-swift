@@ -71,7 +71,7 @@ public protocol LFScreen {
 }
 
 /// For SDKs that wrap this one: the label sent as the batch's `sv` and in the user agent. Read once,
-/// when `start` builds the engine. Defaults to `ios-0.1.0`, or `macos-0.1.0` on macOS and Mac
+/// when `start` builds the engine. Defaults to `ios-0.2.0`, or `macos-0.2.0` on macOS and Mac
 /// Catalyst. A label that is not 1 to 24 of `A-Z a-z 0-9 . _ + -`, starting with a letter, is
 /// replaced by the default with one log line.
 public enum WrapperBridge {
@@ -99,7 +99,7 @@ public enum WrapperBridge {
 }
 
 enum SDKLabel {
-    static let version = "0.1.0"
+    static let version = "0.2.0"
 
     static var platformDefault: String {
         #if os(macOS) || targetEnvironment(macCatalyst)
